@@ -1,9 +1,85 @@
 include "../model/ResonateModel.dfy"
 include "../model/CoordinationModel.dfy"
+include "../executable/SchedulePlannerKernel.dfy"
+include "../executable/RuntimeStateKernel.dfy"
+include "../executable/TimeoutBatchKernel.dfy"
 
 module ResonateCoordinationProofs {
   import Core = ResonateModel
   import C = ResonateCoordinationModel
+  import K = SchedulePlannerKernel
+  import RK = RuntimeStateKernel
+  import TK = TimeoutBatchKernel
+
+  function TimeoutKernelPromiseState(state: TK.PromiseState): Core.PromiseState {
+    if state == TK.Pending then Core.Pending
+    else if state == TK.Resolved then Core.Resolved
+    else if state == TK.Rejected then Core.Rejected
+    else if state == TK.RejectedCanceled then Core.RejectedCanceled
+    else Core.RejectedTimedout
+  }
+
+  function TimeoutKernelTaskState(state: TK.TaskState): Core.TaskState {
+    if state == TK.TaskPending then Core.TaskPending
+    else if state == TK.Acquired then Core.Acquired
+    else if state == TK.Suspended then Core.Suspended
+    else if state == TK.Halted then Core.Halted
+    else Core.Fulfilled
+  }
+
+  function TimeoutKernelPromises(promises: map<C.Id, TK.PromiseRec>): map<C.Id, Core.Promise> {
+    map id: C.Id | id in promises :: Core.PromiseRec(
+      TimeoutKernelPromiseState(promises[id].state),
+      promises[id].timeoutAt,
+      promises[id].timer)
+  }
+
+  function TimeoutKernelTasks(tasks: map<C.Id, TK.TaskRec>): map<C.Id, Core.Task> {
+    map id: C.Id | id in tasks :: Core.TaskRec(
+      TimeoutKernelTaskState(tasks[id].state),
+      tasks[id].version)
+  }
+
+  function TimeoutKernelCallbacks(callbacks: set<TK.CallbackKey>): set<C.CallbackKey> {
+    set tcb: TK.CallbackKey | tcb in callbacks :: C.CallbackKey(tcb.awaited, tcb.awaiter)
+  }
+
+  function TimeoutKernelListeners(listeners: set<TK.ListenerKey>): set<C.ListenerKey> {
+    set tl: TK.ListenerKey | tl in listeners :: C.ListenerKey(tl.promise, tl.address)
+  }
+
+  function TimeoutKernelRows(rows: TK.TimeoutRows): C.TimeoutRows {
+    C.TimeoutRowsRec(rows.retryAt, rows.leaseAt)
+  }
+
+  function TimeoutKernelState(state: TK.TimeoutBatchState, rows: TK.TimeoutRows): C.CoordinationState {
+    C.State(
+      Core.State(
+        TimeoutKernelPromises(state.promises),
+        TimeoutKernelTasks(state.tasks),
+        state.promiseTimeouts,
+        set id: C.Id | id in rows.retryAt,
+        set id: C.Id | id in rows.leaseAt),
+      TimeoutKernelCallbacks(state.callbacks),
+      TimeoutKernelCallbacks(state.readyCallbacks),
+      TimeoutKernelListeners(state.listeners),
+      state.outgoingExec,
+      TimeoutKernelListeners(state.outgoingUnblock),
+      map[])
+  }
+
+  lemma TimeoutKernelHasReadyCallbackMatchesModel(s: TK.TimeoutBatchState, rows: TK.TimeoutRows, awaiter: C.Id)
+    ensures TK.HasReadyCallbackFor(s, awaiter) <==> C.HasReadyCallbackFor(TimeoutKernelState(s, rows), awaiter)
+  {
+    if TK.HasReadyCallbackFor(s, awaiter) {
+      var tcb: TK.CallbackKey :| tcb in s.readyCallbacks && tcb.awaiter == awaiter;
+      assert C.CallbackKey(tcb.awaited, tcb.awaiter) in TimeoutKernelState(s, rows).readyCallbacks;
+    }
+    if C.HasReadyCallbackFor(TimeoutKernelState(s, rows), awaiter) {
+      var cb: C.CallbackKey :| cb in TimeoutKernelState(s, rows).readyCallbacks && cb.awaiter == awaiter;
+      assert cb in TimeoutKernelCallbacks(s.readyCallbacks);
+    }
+  }
 
   predicate DistinctIds(xs: seq<C.Id>)
     decreases |xs|
@@ -1800,6 +1876,69 @@ module ResonateCoordinationProofs {
     }
   }
 
+  function PlannerKernelRunRequests(scheduleId: C.Id, promiseTimeout: nat, runTimes: seq<nat>): seq<C.ScheduleRunRequest>
+    decreases |runTimes|
+  {
+    if |runTimes| == 0 then []
+    else ([C.ScheduleRunRequest(scheduleId + runTimes[0] + 1, runTimes[0], runTimes[0] + promiseTimeout)] +
+      PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes[1..]))
+  }
+
+  lemma PlannerKernelRunRequestsAt(scheduleId: C.Id, promiseTimeout: nat, runTimes: seq<nat>, index: nat)
+    requires index < |runTimes|
+    ensures |PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)| == |runTimes|
+    ensures PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)[index].createdAt == runTimes[index]
+    ensures PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)[index].timeoutAt == runTimes[index] + promiseTimeout
+    decreases |runTimes|
+  {
+    if index == 0 {
+    } else {
+      PlannerKernelRunRequestsAt(scheduleId, promiseTimeout, runTimes[1..], index - 1);
+    }
+  }
+
+  lemma PlannerKernelBoundaryImpliesExhaustedRunPrefix(scheduleId: C.Id, promiseTimeout: nat, now: nat, candidates: seq<nat>, runTimes: seq<nat>, finalNextRunAt: nat)
+    requires K.ValidScheduleCandidateStream(now, candidates)
+    requires K.ExhaustedDuePrefixBoundary(now, candidates, runTimes, finalNextRunAt)
+    ensures C.ExhaustedRunPrefix(C.ScheduleRec(candidates[0], 0, false, promiseTimeout), now, PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes), finalNextRunAt)
+  {
+    assert |runTimes| > 0;
+    PlannerKernelRunRequestsAt(scheduleId, promiseTimeout, runTimes, 0);
+    assert PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)[0].createdAt == runTimes[0];
+    assert runTimes[0] == candidates[0];
+    forall i: nat | i < |PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)|
+      ensures PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)[i].createdAt <= now
+    {
+      PlannerKernelRunRequestsAt(scheduleId, promiseTimeout, runTimes, i);
+    }
+    forall i: nat | i + 1 < |PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)|
+      ensures PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)[i].createdAt < PlannerKernelRunRequests(scheduleId, promiseTimeout, runTimes)[i + 1].createdAt
+    {
+      PlannerKernelRunRequestsAt(scheduleId, promiseTimeout, runTimes, i);
+      PlannerKernelRunRequestsAt(scheduleId, promiseTimeout, runTimes, i + 1);
+      assert runTimes[i] < runTimes[i + 1];
+    }
+  }
+
+  lemma ExecutablePlannerRefinesExhaustedRunPrefix(scheduleId: C.Id, promiseTimeout: nat, now: nat, candidates: seq<nat>)
+    requires K.ValidScheduleCandidateStream(now, candidates)
+    ensures |K.PlannedRunTimes(now, candidates)| > 0
+    ensures C.ExhaustedRunPrefix(
+      C.ScheduleRec(candidates[0], 0, false, promiseTimeout),
+      now,
+      PlannerKernelRunRequests(scheduleId, promiseTimeout, K.PlannedRunTimes(now, candidates)),
+      K.PlannedFinalNextRunAt(now, candidates))
+  {
+    K.ValidStreamPlannedBoundary(now, candidates);
+    PlannerKernelBoundaryImpliesExhaustedRunPrefix(
+      scheduleId,
+      promiseTimeout,
+      now,
+      candidates,
+      K.PlannedRunTimes(now, candidates),
+      K.PlannedFinalNextRunAt(now, candidates));
+  }
+
   lemma ScheduleRunBatchMaterializesRunsAndAdvancesSchedule(s: C.CoordinationState, scheduleId: C.Id, firstRunAt: nat, promiseTimeout: nat, runs: seq<C.ScheduleRunRequest>, finalNextRunAt: nat)
     requires C.Valid(s)
     requires |runs| > 0
@@ -1837,5 +1976,144 @@ module ResonateCoordinationProofs {
     assert scheduleId in C.DueSchedulesAt(created, now);
     assert finalNextRunAt > runs[|runs| - 1].createdAt;
     ScheduleRunBatchMaterializesRunsAndAdvancesSchedule(s, scheduleId, firstRunAt, promiseTimeout, runs, finalNextRunAt);
+  }
+
+  lemma ExecutablePlannerAdvanceBatchFromDueSchedule(s: C.CoordinationState, scheduleId: C.Id, firstRunAt: nat, promiseTimeout: nat, now: nat, candidates: seq<nat>) returns (runs: seq<C.ScheduleRunRequest>, finalNextRunAt: nat)
+    requires C.Valid(s)
+    requires scheduleId !in s.schedules
+    requires K.ValidScheduleCandidateStream(now, candidates)
+    requires candidates[0] == firstRunAt
+    ensures |K.PlannedRunTimes(now, candidates)| > 0
+    ensures runs == PlannerKernelRunRequests(scheduleId, promiseTimeout, K.PlannedRunTimes(now, candidates))
+    ensures |runs| > 0
+    ensures finalNextRunAt == K.PlannedFinalNextRunAt(now, candidates)
+    ensures C.ExhaustedRunPrefix(
+      C.ScheduleCreate(s, scheduleId, firstRunAt, promiseTimeout).schedules[scheduleId],
+      now,
+      runs,
+      finalNextRunAt)
+    ensures scheduleId in C.DueSchedulesAt(C.ScheduleCreate(s, scheduleId, firstRunAt, promiseTimeout), now)
+    ensures C.ScheduleRunBatch(
+      C.ScheduleCreate(s, scheduleId, firstRunAt, promiseTimeout),
+      scheduleId,
+      runs,
+      finalNextRunAt).schedules[scheduleId].hasRun
+    ensures C.ScheduleRunBatch(
+      C.ScheduleCreate(s, scheduleId, firstRunAt, promiseTimeout),
+      scheduleId,
+      runs,
+      finalNextRunAt).schedules[scheduleId].lastRunAt == runs[|runs| - 1].createdAt
+    ensures C.ScheduleRunBatch(
+      C.ScheduleCreate(s, scheduleId, firstRunAt, promiseTimeout),
+      scheduleId,
+      runs,
+      finalNextRunAt).schedules[scheduleId].nextRunAt == finalNextRunAt
+  {
+    var created := C.ScheduleCreate(s, scheduleId, firstRunAt, promiseTimeout);
+    runs := PlannerKernelRunRequests(scheduleId, promiseTimeout, K.PlannedRunTimes(now, candidates));
+    finalNextRunAt := K.PlannedFinalNextRunAt(now, candidates);
+    ExecutablePlannerRefinesExhaustedRunPrefix(scheduleId, promiseTimeout, now, candidates);
+    assert created.schedules[scheduleId] == C.ScheduleRec(firstRunAt, 0, false, promiseTimeout);
+    DueScheduleSelectionAndExhaustedPrefixAdvanceBatch(s, scheduleId, firstRunAt, promiseTimeout, now, runs, finalNextRunAt);
+  }
+
+  lemma TrustedSchedulePlannerInputAdvanceBatchFromDueSchedule(s: C.CoordinationState, scheduleId: C.Id, cron: string, promiseTimeout: nat, now: nat, candidates: seq<nat>) returns (runs: seq<C.ScheduleRunRequest>, finalNextRunAt: nat)
+    requires C.Valid(s)
+    requires scheduleId !in s.schedules
+    requires |candidates| > 0
+    requires C.TrustedSchedulePlannerInput(C.ScheduleRec(candidates[0], 0, false, promiseTimeout), cron, now, candidates)
+    ensures runs == PlannerKernelRunRequests(scheduleId, promiseTimeout, K.PlannedRunTimes(now, candidates))
+    ensures |runs| > 0
+    ensures finalNextRunAt == K.PlannedFinalNextRunAt(now, candidates)
+    ensures C.ExhaustedRunPrefix(
+      C.ScheduleCreate(s, scheduleId, candidates[0], promiseTimeout).schedules[scheduleId],
+      now,
+      runs,
+      finalNextRunAt)
+    ensures scheduleId in C.DueSchedulesAt(C.ScheduleCreate(s, scheduleId, candidates[0], promiseTimeout), now)
+    ensures C.ScheduleRunBatch(
+      C.ScheduleCreate(s, scheduleId, candidates[0], promiseTimeout),
+      scheduleId,
+      runs,
+      finalNextRunAt).schedules[scheduleId].hasRun
+    ensures C.ScheduleRunBatch(
+      C.ScheduleCreate(s, scheduleId, candidates[0], promiseTimeout),
+      scheduleId,
+      runs,
+      finalNextRunAt).schedules[scheduleId].lastRunAt == runs[|runs| - 1].createdAt
+    ensures C.ScheduleRunBatch(
+      C.ScheduleCreate(s, scheduleId, candidates[0], promiseTimeout),
+      scheduleId,
+      runs,
+      finalNextRunAt).schedules[scheduleId].nextRunAt == finalNextRunAt
+  {
+    K.TrustedCronCandidateStreamIsValid(now, candidates[0], candidates);
+    runs, finalNextRunAt := ExecutablePlannerAdvanceBatchFromDueSchedule(s, scheduleId, candidates[0], promiseTimeout, now, candidates);
+  }
+
+  lemma ExecutableTimeoutKernelPreservesPhaseOrder(s: TK.TimeoutBatchState, expiredPromises: seq<C.Id>, readyAwaiters: seq<C.Id>, expiredRetries: seq<C.Id>, expiredLeases: seq<C.Id>)
+    ensures TK.ProcessTimeoutBatch(s, expiredPromises, readyAwaiters, expiredRetries, expiredLeases) ==
+            TK.TimeoutStatement3(TK.TimeoutStatement2(TK.TimeoutStatement1(s, expiredPromises, readyAwaiters), expiredRetries), expiredLeases)
+  {
+  }
+
+  lemma ExecutableRetryTimeoutRowsRefineAbstractLaw(s: TK.TimeoutBatchState, rows: TK.TimeoutRows, id: C.Id, now: nat, retryDelay: nat)
+    ensures TimeoutKernelRows(TK.ExpireRetryTimeoutRows(s, rows, id, now, retryDelay)) ==
+            C.ExpireRetryTimeoutRows(TimeoutKernelState(s, rows), TimeoutKernelRows(rows), id, now, retryDelay)
+  {
+  }
+
+  lemma ExecutableLeaseTimeoutRowsRefineAbstractLaw(s: TK.TimeoutBatchState, rows: TK.TimeoutRows, id: C.Id, now: nat, retryDelay: nat)
+    ensures TimeoutKernelRows(TK.ExpireLeaseTimeoutRows(s, rows, id, now, retryDelay)) ==
+            C.ExpireLeaseTimeoutRows(TimeoutKernelState(s, rows), TimeoutKernelRows(rows), id, now, retryDelay)
+  {
+  }
+
+  lemma ExecutableStatement1ReadyAwaiterRefinesAbstractLaw(s: TK.TimeoutBatchState, rows: TK.TimeoutRows, awaiter: C.Id, now: nat, retryDelay: nat)
+    ensures TimeoutKernelState(TK.ResumeReadyAwaiter(s, awaiter), TK.ResumeReadyAwaiterRows(s, rows, awaiter, now, retryDelay)).outgoingExec ==
+            C.ResumeReadyAwaiter(TimeoutKernelState(s, rows), awaiter).outgoingExec
+    ensures TimeoutKernelRows(TK.ResumeReadyAwaiterRows(s, rows, awaiter, now, retryDelay)) ==
+            C.ResumeReadyAwaiterRows(TimeoutKernelState(s, rows), TimeoutKernelRows(rows), awaiter, now, retryDelay)
+  {
+    TimeoutKernelHasReadyCallbackMatchesModel(s, rows, awaiter);
+    if awaiter !in s.tasks || s.tasks[awaiter].state != TK.Suspended || !TK.HasReadyCallbackFor(s, awaiter) {
+      assert TK.ResumeReadyAwaiter(s, awaiter) == s;
+      assert TK.ResumeReadyAwaiterRows(s, rows, awaiter, now, retryDelay) == rows;
+      assert C.ResumeReadyAwaiter(TimeoutKernelState(s, rows), awaiter) == TimeoutKernelState(s, rows);
+      assert C.ResumeReadyAwaiterRows(TimeoutKernelState(s, rows), TimeoutKernelRows(rows), awaiter, now, retryDelay) == TimeoutKernelRows(rows);
+    } else {
+      assert TK.ResumeReadyAwaiter(s, awaiter).outgoingExec == s.outgoingExec[awaiter := s.tasks[awaiter].version + 1];
+      assert C.ResumeReadyAwaiter(TimeoutKernelState(s, rows), awaiter).outgoingExec == TimeoutKernelState(s, rows).outgoingExec[awaiter := TimeoutKernelState(s, rows).core.tasks[awaiter].version + 1];
+      assert TimeoutKernelState(s, rows).core.tasks[awaiter].version == s.tasks[awaiter].version;
+      assert TK.ResumeReadyAwaiterRows(s, rows, awaiter, now, retryDelay) == TK.TimeoutRowsRec(rows.retryAt[awaiter := now + retryDelay], rows.leaseAt - {awaiter});
+      assert C.ResumeReadyAwaiterRows(TimeoutKernelState(s, rows), TimeoutKernelRows(rows), awaiter, now, retryDelay) == C.TimeoutRowsRec(rows.retryAt[awaiter := now + retryDelay], rows.leaseAt - {awaiter});
+    }
+  }
+
+  lemma ExecutableStatement1ListenerUnblockRefinesAbstractLaw(s: TK.TimeoutBatchState, rows: TK.TimeoutRows, id: C.Id)
+    ensures TimeoutKernelState(TK.ExpirePromiseTimeout(s, id), TK.ExpirePromiseTimeoutRows(s, rows, id)).outgoingUnblock ==
+            C.ExpirePromiseTimeout(TimeoutKernelState(s, rows), id).outgoingUnblock
+  {
+    if id !in s.promises || s.promises[id].state != TK.Pending {
+      assert TK.ExpirePromiseTimeout(s, id) == s;
+      assert C.ExpirePromiseTimeout(TimeoutKernelState(s, rows), id) == TimeoutKernelState(s, rows);
+    } else {
+      assert TK.ExpirePromiseTimeout(s, id).outgoingUnblock == s.outgoingUnblock + TK.ListenersFor(s.listeners, id);
+      assert C.ExpirePromiseTimeout(TimeoutKernelState(s, rows), id).outgoingUnblock == TimeoutKernelState(s, rows).outgoingUnblock + C.ListenersFor(TimeoutKernelState(s, rows).listeners, id);
+      assert TimeoutKernelListeners(TK.ListenersFor(s.listeners, id)) == C.ListenersFor(TimeoutKernelState(s, rows).listeners, id);
+    }
+  }
+
+  lemma ExecutableScheduleCreateMatchesBoundary(firstRunAt: nat, promiseTimeout: nat)
+    ensures RK.ScheduleCreate(firstRunAt, promiseTimeout) == RK.ScheduleRec(firstRunAt, 0, false, promiseTimeout)
+  {
+  }
+
+  lemma ExecutableScheduleAdvanceMatchesBoundary(nextRunAt: nat, lastRunAt: nat, hasRun: bool, promiseTimeout: nat, runTimes: seq<nat>, finalNextRunAt: nat)
+    requires RK.ValidScheduleAdvanceInput(RK.ScheduleRec(nextRunAt, lastRunAt, hasRun, promiseTimeout), runTimes, finalNextRunAt)
+    ensures RK.ScheduleAdvance(RK.ScheduleRec(nextRunAt, lastRunAt, hasRun, promiseTimeout), runTimes, finalNextRunAt).hasRun
+    ensures RK.ScheduleAdvance(RK.ScheduleRec(nextRunAt, lastRunAt, hasRun, promiseTimeout), runTimes, finalNextRunAt).lastRunAt == runTimes[|runTimes| - 1]
+    ensures RK.ScheduleAdvance(RK.ScheduleRec(nextRunAt, lastRunAt, hasRun, promiseTimeout), runTimes, finalNextRunAt).nextRunAt == finalNextRunAt
+  {
   }
 }
