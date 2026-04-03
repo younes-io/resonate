@@ -1282,6 +1282,18 @@ impl<'a> Db for SqliteDb<'a> {
     }
 
     fn process_timeouts(&self, time: i64) -> StorageResult<()> {
+        // Refinement note:
+        //   CoordinationModel.ProcessTimeoutBatch models this routine as:
+        //   1) ApplyPromiseTimeouts
+        //   2) ResumeReadyAwaiters
+        //   3) ApplyRetryTimeouts
+        //   4) ApplyLeaseTimeouts
+        //
+        // See proofs/dafny/proofs/CoordinationProofs.dfy:
+        //   ProcessTimeoutBatchEqualsSqliteTimeoutStatements
+        //
+        // The Dafny boundary is semantic rather than line-by-line SQL equivalence,
+        // and it does not cover listener-address authorization or callback registration.
         // Statement 1: Process expired promise timeouts
         let mut stmt = self.conn.prepare(
             "SELECT id, timer, timeout_at FROM promises WHERE state = 'pending' AND timeout_at <= ?1"
@@ -1669,4 +1681,686 @@ fn row_to_schedule(row: &rusqlite::Row) -> rusqlite::Result<ScheduleRecord> {
         next_run_at: row.get(8)?,
         last_run_at: row.get(9)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processing::processing_timeouts::process_all_timeouts;
+    use crate::persistence::ScheduleRun;
+    use crate::types::{PromiseState, Snapshot, TaskState};
+
+    fn with_test_db<T>(f: impl FnOnce(&SqliteDb<'_>) -> T) -> T {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let db = SqliteDb {
+            conn: &conn,
+            task_retry_timeout: 50,
+        };
+        f(&db)
+    }
+
+    fn selected_retry_timeout_ids(db: &SqliteDb<'_>, now: i64) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
+                 WHERE tt.timeout_type = 0 AND tt.timeout_at <= ?1 AND t.state = 'pending'
+                 ORDER BY tt.id",
+            )
+            .unwrap();
+        let mut rows = stmt.query(params![now]).unwrap();
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            ids.push(row.get(0).unwrap());
+        }
+        ids
+    }
+
+    fn selected_lease_timeout_ids(db: &SqliteDb<'_>, now: i64) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
+                 WHERE tt.timeout_type = 1 AND tt.timeout_at <= ?1 AND t.state = 'acquired'
+                 ORDER BY tt.id",
+            )
+            .unwrap();
+        let mut rows = stmt.query(params![now]).unwrap();
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            ids.push(row.get(0).unwrap());
+        }
+        ids
+    }
+
+    fn snapshot_timeout(snapshot: &Snapshot, id: &str) -> (i32, i64) {
+        let row = snapshot
+            .task_timeouts
+            .iter()
+            .find(|tt| tt.id == id)
+            .unwrap_or_else(|| panic!("missing task_timeout row for {id}"));
+        (row.timeout_type, row.timeout)
+    }
+
+    #[test]
+    fn settlement_resumes_suspended_awaiter_and_enqueues_execute() {
+        with_test_db(|db| {
+            db.promise_create(&PromiseCreateParams {
+                id: "awaited",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: "{}",
+                timeout_at: 500,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: None,
+            })
+            .unwrap();
+
+            let created = db
+                .task_create(&TaskCreateParams {
+                    promise_id: "awaiter",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: r#"{"resonate:target":"worker://tests"}"#,
+                    timeout_at: 600,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    ttl: 25,
+                    pid: "worker-1",
+                })
+                .unwrap()
+                .unwrap();
+            assert!(created.task_created);
+            assert!(!created.task_acquired);
+
+            let suspended = db.task_suspend("awaiter", 0, &["awaited"]).unwrap();
+            assert!(suspended.task_matched);
+            assert!(suspended.was_suspended);
+            assert_eq!(suspended.missing_count, 0);
+
+            let before = db.task_get("awaiter").unwrap().unwrap();
+            assert_eq!(before.state, TaskState::Suspended);
+            assert_eq!(before.version, 0);
+            assert_eq!(before.resumes, 0);
+
+            let settled = db
+                .promise_settle(&PromiseSettleParams {
+                    id: "awaited",
+                    state: "resolved",
+                    value_headers: None,
+                    value_data: Some("done"),
+                    settled_at: 100,
+                })
+                .unwrap();
+            assert!(settled.was_settled);
+            assert_eq!(settled.promise.unwrap().state, PromiseState::Resolved);
+
+            let after = db.task_get("awaiter").unwrap().unwrap();
+            assert_eq!(after.state, TaskState::Pending);
+            assert_eq!(after.version, 1);
+            assert_eq!(after.resumes, 1);
+            let snapshot = db.snap().unwrap();
+            assert!(snapshot.listeners.is_empty());
+            assert_eq!(snapshot_timeout(&snapshot, "awaiter"), (0, 150));
+
+            let (execute, unblock) = db.take_outgoing(10).unwrap();
+            assert!(unblock.is_empty());
+            assert_eq!(execute.len(), 1);
+            assert_eq!(execute[0].id, "awaiter");
+            assert_eq!(execute[0].version, 1);
+            assert_eq!(execute[0].address, "worker://tests");
+        });
+    }
+
+    #[test]
+    fn settlement_unblocks_registered_listeners() {
+        with_test_db(|db| {
+            db.promise_create(&PromiseCreateParams {
+                id: "awaited",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: "{}",
+                timeout_at: 500,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: None,
+            })
+            .unwrap();
+
+            let promise = db
+                .promise_register_listener("awaited", "https://listener.test/hook")
+                .unwrap()
+                .unwrap();
+            assert_eq!(promise.state, PromiseState::Pending);
+
+            db.promise_settle(&PromiseSettleParams {
+                id: "awaited",
+                state: "resolved",
+                value_headers: None,
+                value_data: Some("payload"),
+                settled_at: 101,
+            })
+            .unwrap();
+
+            let snapshot = db.snap().unwrap();
+            assert!(snapshot.listeners.is_empty());
+            let awaited = snapshot
+                .promises
+                .iter()
+                .find(|promise| promise.id == "awaited")
+                .unwrap();
+            assert_eq!(awaited.state, PromiseState::Resolved);
+            assert_eq!(awaited.value.data.as_deref(), Some("payload"));
+
+            let (execute, unblock) = db.take_outgoing(10).unwrap();
+            assert!(execute.is_empty());
+            assert_eq!(unblock.len(), 1);
+            assert_eq!(unblock[0].address, "https://listener.test/hook");
+            assert_eq!(unblock[0].promise.id, "awaited");
+            assert_eq!(unblock[0].promise.state, PromiseState::Resolved);
+            assert_eq!(unblock[0].promise.value.data.as_deref(), Some("payload"));
+        });
+    }
+
+    #[test]
+    fn schedule_run_is_idempotent_and_advances_next_run() {
+        with_test_db(|db| {
+            let schedule = db
+                .schedule_create(&ScheduleCreateParams {
+                    id: "sched",
+                    cron: "* * * * *",
+                    promise_id: "sched-{{.timestamp}}",
+                    promise_timeout: 500,
+                    promise_param_headers: None,
+                    promise_param_data: Some("body"),
+                    promise_tags: r#"{"env":"test"}"#,
+                    created_at: 0,
+                    next_run_at: 1_000,
+                })
+                .unwrap();
+            assert_eq!(schedule.next_run_at, 1_000);
+            assert_eq!(schedule.last_run_at, None);
+
+            let runs = vec![
+                ScheduleRun {
+                    id: "sched-1000".to_string(),
+                    timeout_at: 1_500,
+                    created_at: 1_000,
+                },
+                ScheduleRun {
+                    id: "sched-2000".to_string(),
+                    timeout_at: 2_500,
+                    created_at: 2_000,
+                },
+            ];
+
+            let updated = db
+                .schedule_run("sched", 2_000, 3_000, &runs)
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.last_run_at, Some(2_000));
+            assert_eq!(updated.next_run_at, 3_000);
+
+            let snapshot = db.snap().unwrap();
+            let created: Vec<_> = snapshot
+                .promises
+                .iter()
+                .filter(|promise| promise.id.starts_with("sched-"))
+                .collect();
+            assert_eq!(created.len(), 2);
+            assert!(created
+                .iter()
+                .all(|promise| promise.state == PromiseState::Pending));
+            assert!(created
+                .iter()
+                .all(|promise| promise.param.data.as_deref() == Some("body")));
+            assert!(created
+                .iter()
+                .all(|promise| promise.tags.get("env").map(String::as_str) == Some("test")));
+            assert_eq!(snapshot.promise_timeouts.len(), 2);
+
+            db.schedule_run("sched", 2_000, 3_000, &runs).unwrap();
+            let snapshot = db.snap().unwrap();
+            assert_eq!(
+                snapshot
+                    .promises
+                    .iter()
+                    .filter(|promise| promise.id.starts_with("sched-"))
+                    .count(),
+                2
+            );
+            assert_eq!(snapshot.promise_timeouts.len(), 2);
+        });
+    }
+
+    #[test]
+    fn get_expired_schedules_includes_exactly_due_and_multiple_due_but_excludes_future() {
+        with_test_db(|db| {
+            for (id, next_run_at) in [("sched-a", 1_000), ("sched-b", 1_000), ("sched-future", 1_001)] {
+                db.schedule_create(&ScheduleCreateParams {
+                    id,
+                    cron: "* * * * *",
+                    promise_id: "sched-{{.timestamp}}",
+                    promise_timeout: 500,
+                    promise_param_headers: None,
+                    promise_param_data: Some("body"),
+                    promise_tags: r#"{"env":"test"}"#,
+                    created_at: 0,
+                    next_run_at,
+                })
+                .unwrap();
+            }
+
+            let mut ids: Vec<_> = db
+                .get_expired_schedules(1_000)
+                .unwrap()
+                .into_iter()
+                .map(|schedule| schedule.id)
+                .collect();
+            ids.sort();
+
+            assert_eq!(ids, vec!["sched-a".to_string(), "sched-b".to_string()]);
+        });
+    }
+
+    #[test]
+    fn process_all_timeouts_materializes_overdue_schedule_prefix() {
+        with_test_db(|db| {
+            db.schedule_create(&ScheduleCreateParams {
+                id: "sched",
+                cron: "* * * * *",
+                promise_id: "sched-{{.timestamp}}",
+                promise_timeout: 500,
+                promise_param_headers: None,
+                promise_param_data: Some("body"),
+                promise_tags: r#"{"env":"test"}"#,
+                created_at: 0,
+                next_run_at: 60_000,
+            })
+            .unwrap();
+
+            process_all_timeouts(db, 180_000).unwrap();
+
+            let schedule = db.schedule_get("sched").unwrap().unwrap();
+            assert_eq!(schedule.last_run_at, Some(180_000));
+            assert_eq!(schedule.next_run_at, 240_000);
+
+            let snapshot = db.snap().unwrap();
+            let mut ids: Vec<_> = snapshot
+                .promises
+                .iter()
+                .filter(|promise| promise.id.starts_with("sched-"))
+                .map(|promise| promise.id.clone())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec![
+                "sched-120000".to_string(),
+                "sched-180000".to_string(),
+                "sched-60000".to_string(),
+            ]);
+            assert_eq!(snapshot.promise_timeouts.len(), 3);
+        });
+    }
+
+    #[test]
+    fn process_timeouts_batches_promise_retry_and_lease_effects() {
+        with_test_db(|db| {
+            db.promise_create(&PromiseCreateParams {
+                id: "awaited-batch",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: "{}",
+                timeout_at: 10,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: None,
+            })
+            .unwrap();
+            db.promise_register_listener("awaited-batch", "https://listener.test/batch")
+                .unwrap();
+
+            db.task_create(&TaskCreateParams {
+                promise_id: "awaiter-batch",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://awaiter"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                ttl: 25,
+                pid: "worker-a",
+            })
+            .unwrap();
+            let suspended = db
+                .task_suspend("awaiter-batch", 0, &["awaited-batch"])
+                .unwrap();
+            assert!(suspended.was_suspended);
+
+            db.promise_create(&PromiseCreateParams {
+                id: "retry-batch",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://retry"}"#,
+                timeout_at: 500,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://retry"),
+            })
+            .unwrap();
+            let _ = db.take_outgoing(10).unwrap();
+
+            db.task_create(&TaskCreateParams {
+                promise_id: "lease-batch",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://lease"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                ttl: 20,
+                pid: "worker-l",
+            })
+            .unwrap();
+
+            db.process_timeouts(100).unwrap();
+
+            let awaited = db.promise_get("awaited-batch").unwrap().unwrap();
+            assert_eq!(awaited.state, PromiseState::RejectedTimedout);
+
+            let awaiter = db.task_get("awaiter-batch").unwrap().unwrap();
+            assert_eq!(awaiter.state, TaskState::Pending);
+            assert_eq!(awaiter.version, 1);
+            assert_eq!(awaiter.resumes, 1);
+
+            let retry = db.task_get("retry-batch").unwrap().unwrap();
+            assert_eq!(retry.state, TaskState::Pending);
+            assert_eq!(retry.version, 0);
+
+            let lease = db.task_get("lease-batch").unwrap().unwrap();
+            assert_eq!(lease.state, TaskState::Pending);
+            assert_eq!(lease.version, 1);
+
+            let snapshot = db.snap().unwrap();
+            assert!(snapshot.listeners.is_empty());
+            assert_eq!(snapshot_timeout(&snapshot, "awaiter-batch"), (0, 150));
+            assert_eq!(snapshot_timeout(&snapshot, "retry-batch"), (0, 150));
+            assert_eq!(snapshot_timeout(&snapshot, "lease-batch"), (0, 150));
+            assert!(snapshot.task_timeouts.iter().all(|tt| tt.timeout_type == 0));
+
+            let (mut execute, unblock) = db.take_outgoing(10).unwrap();
+            execute.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(execute.len(), 3);
+            assert_eq!(execute[0].id, "awaiter-batch");
+            assert_eq!(execute[0].version, 1);
+            assert_eq!(execute[0].address, "worker://awaiter");
+            assert_eq!(execute[1].id, "lease-batch");
+            assert_eq!(execute[1].version, 1);
+            assert_eq!(execute[1].address, "worker://lease");
+            assert_eq!(execute[2].id, "retry-batch");
+            assert_eq!(execute[2].version, 0);
+            assert_eq!(execute[2].address, "worker://retry");
+
+            assert_eq!(unblock.len(), 1);
+            assert_eq!(unblock[0].address, "https://listener.test/batch");
+            assert_eq!(unblock[0].promise.id, "awaited-batch");
+            assert_eq!(unblock[0].promise.state, PromiseState::RejectedTimedout);
+        });
+    }
+
+    #[test]
+    fn timeout_query_membership_matches_snapshot_predicates() {
+        with_test_db(|db| {
+            db.promise_create(&PromiseCreateParams {
+                id: "retry-due",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://retry-due"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://retry-due"),
+            })
+            .unwrap();
+            db.promise_create(&PromiseCreateParams {
+                id: "retry-future",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://retry-future"}"#,
+                timeout_at: 1_000,
+                created_at: 60,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://retry-future"),
+            })
+            .unwrap();
+            let _ = db.take_outgoing(10).unwrap();
+
+            db.promise_create(&PromiseCreateParams {
+                id: "lease-due",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://lease-due"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://lease-due"),
+            })
+            .unwrap();
+            db.promise_create(&PromiseCreateParams {
+                id: "lease-future",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://lease-future"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://lease-future"),
+            })
+            .unwrap();
+            let _ = db.take_outgoing(10).unwrap();
+            let acquired_due = db
+                .task_acquire(&TaskAcquireParams {
+                    task_id: "lease-due",
+                    version: 0,
+                    time: 80,
+                    ttl: 20,
+                    pid: "worker-due",
+                })
+                .unwrap();
+            assert!(acquired_due.was_acquired);
+            let acquired_future = db
+                .task_acquire(&TaskAcquireParams {
+                    task_id: "lease-future",
+                    version: 0,
+                    time: 81,
+                    ttl: 20,
+                    pid: "worker-future",
+                })
+                .unwrap();
+            assert!(acquired_future.was_acquired);
+
+            let snapshot = db.snap().unwrap();
+            let mut expected_retry: Vec<String> = snapshot
+                .task_timeouts
+                .iter()
+                .filter(|tt| tt.timeout_type == 0 && tt.timeout <= 100)
+                .filter(|tt| {
+                    snapshot
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == tt.id)
+                        .map(|task| task.state == TaskState::Pending)
+                        .unwrap_or(false)
+                })
+                .map(|tt| tt.id.clone())
+                .collect();
+            expected_retry.sort();
+
+            let mut expected_lease: Vec<String> = snapshot
+                .task_timeouts
+                .iter()
+                .filter(|tt| tt.timeout_type == 1 && tt.timeout <= 100)
+                .filter(|tt| {
+                    snapshot
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == tt.id)
+                        .map(|task| task.state == TaskState::Acquired)
+                        .unwrap_or(false)
+                })
+                .map(|tt| tt.id.clone())
+                .collect();
+            expected_lease.sort();
+
+            assert_eq!(selected_retry_timeout_ids(db, 100), expected_retry);
+            assert_eq!(selected_lease_timeout_ids(db, 100), expected_lease);
+        });
+    }
+
+    #[test]
+    fn process_timeouts_updates_due_rows_without_touching_future_timeout_rows() {
+        with_test_db(|db| {
+            db.promise_create(&PromiseCreateParams {
+                id: "retry-due",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://retry-due"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://retry-due"),
+            })
+            .unwrap();
+            db.promise_create(&PromiseCreateParams {
+                id: "retry-future",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://retry-future"}"#,
+                timeout_at: 1_000,
+                created_at: 60,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://retry-future"),
+            })
+            .unwrap();
+            let _ = db.take_outgoing(10).unwrap();
+
+            db.promise_create(&PromiseCreateParams {
+                id: "lease-due",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://lease-due"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://lease-due"),
+            })
+            .unwrap();
+            db.promise_create(&PromiseCreateParams {
+                id: "lease-future",
+                state: "pending",
+                param_headers: None,
+                param_data: None,
+                tags: r#"{"resonate:target":"worker://lease-future"}"#,
+                timeout_at: 1_000,
+                created_at: 0,
+                settled_at: None,
+                already_timedout: false,
+                address: Some("worker://lease-future"),
+            })
+            .unwrap();
+            let _ = db.take_outgoing(10).unwrap();
+
+            assert!(
+                db.task_acquire(&TaskAcquireParams {
+                    task_id: "lease-due",
+                    version: 0,
+                    time: 80,
+                    ttl: 20,
+                    pid: "worker-due",
+                })
+                .unwrap()
+                .was_acquired
+            );
+            assert!(
+                db.task_acquire(&TaskAcquireParams {
+                    task_id: "lease-future",
+                    version: 0,
+                    time: 81,
+                    ttl: 20,
+                    pid: "worker-future",
+                })
+                .unwrap()
+                .was_acquired
+            );
+            let _ = db.take_outgoing(10).unwrap();
+
+            let before = db.snap().unwrap();
+            assert_eq!(snapshot_timeout(&before, "retry-due"), (0, 50));
+            assert_eq!(snapshot_timeout(&before, "retry-future"), (0, 110));
+            assert_eq!(snapshot_timeout(&before, "lease-due"), (1, 100));
+            assert_eq!(snapshot_timeout(&before, "lease-future"), (1, 101));
+
+            db.process_timeouts(100).unwrap();
+
+            let retry_due = db.task_get("retry-due").unwrap().unwrap();
+            let retry_future = db.task_get("retry-future").unwrap().unwrap();
+            let lease_due = db.task_get("lease-due").unwrap().unwrap();
+            let lease_future = db.task_get("lease-future").unwrap().unwrap();
+            let after = db.snap().unwrap();
+
+            assert_eq!(snapshot_timeout(&after, "retry-due"), (0, 150));
+            assert_eq!(snapshot_timeout(&after, "retry-future"), (0, 110));
+            assert_eq!(snapshot_timeout(&after, "lease-due"), (0, 150));
+            assert_eq!(snapshot_timeout(&after, "lease-future"), (1, 101));
+
+            assert_eq!(retry_due.state, TaskState::Pending);
+            assert_eq!(retry_due.version, 0);
+            assert_eq!(retry_future.state, TaskState::Pending);
+            assert_eq!(retry_future.version, 0);
+            assert_eq!(lease_due.state, TaskState::Pending);
+            assert_eq!(lease_due.version, 1);
+            assert_eq!(lease_future.state, TaskState::Acquired);
+            assert_eq!(lease_future.version, 0);
+
+            let (mut execute, unblock) = db.take_outgoing(10).unwrap();
+            execute.sort_by(|a, b| a.id.cmp(&b.id));
+            assert_eq!(execute.len(), 2);
+            assert_eq!(execute[0].id, "lease-due");
+            assert_eq!(execute[0].version, 1);
+            assert_eq!(execute[0].address, "worker://lease-due");
+            assert_eq!(execute[1].id, "retry-due");
+            assert_eq!(execute[1].version, 0);
+            assert_eq!(execute[1].address, "worker://retry-due");
+            assert!(unblock.is_empty());
+        });
+    }
 }

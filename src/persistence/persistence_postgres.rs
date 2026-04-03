@@ -1701,7 +1701,7 @@ impl Db for PostgresDb<'_> {
             ),
             runs AS (
               SELECT * FROM unnest($4::text[], $5::bigint[], $6::bigint[])
-                AS t(id TEXT, timeout_at BIGINT, created_at BIGINT)
+                AS t(id, timeout_at, created_at)
             ),
             inserted_or_skipped_promises AS (
               INSERT INTO promises (id, state, param_headers, param_data, tags, timeout_at, created_at)
@@ -1755,6 +1755,18 @@ impl Db for PostgresDb<'_> {
     // Timeout processing — three sequential CTE statements
     fn process_timeouts(&self, time: i64) -> StorageResult<()> {
         let trt = self.task_retry_timeout;
+        // Refinement note:
+        //   CoordinationModel.ProcessTimeoutBatch models this routine as:
+        //   1) ApplyPromiseTimeouts
+        //   2) ResumeReadyAwaiters
+        //   3) ApplyRetryTimeouts
+        //   4) ApplyLeaseTimeouts
+        //
+        // See proofs/dafny/proofs/CoordinationProofs.dfy:
+        //   ProcessTimeoutBatchEqualsPostgresTimeoutStatements
+        //
+        // These three SQL statements implement that same semantic phase order.
+        // The theorem does not cover listener-address authorization or callback registration.
         // Statement 1: Process expired promise timeouts
         rt_block_on(sqlx::query(&format!("
             WITH expired AS (
@@ -2029,5 +2041,677 @@ impl Db for PostgresDb<'_> {
             .collect();
 
         Ok((execute_msgs, unblock_msgs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processing::processing_timeouts::process_all_timeouts;
+    use crate::persistence::{
+        PromiseCreateParams, PromiseSettleParams, ScheduleCreateParams, ScheduleRun,
+        TaskCreateParams,
+    };
+    use crate::types::{PromiseState, Snapshot, TaskState};
+    use std::sync::{Mutex, OnceLock};
+
+    fn postgres_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn postgres_test_storage() -> PostgresStorage {
+        let url = std::env::var("RESONATE_TEST_POSTGRES_URL")
+            .unwrap_or_else(|_| "postgres://resonate:resonate@127.0.0.1:5432/resonate".to_string());
+        let storage = PostgresStorage::connect(&url, 4, 50).await.unwrap();
+        storage.init().await.unwrap();
+        storage.transact(|db| db.debug_reset()).await.unwrap();
+        storage
+    }
+
+    fn selected_retry_timeout_ids(db: &PostgresDb<'_>, now: i64) -> Vec<String> {
+        let rows = rt_block_on(
+            sqlx::query(
+                "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
+                 WHERE tt.timeout_type = 0 AND tt.timeout_at <= $1 AND t.state = 'pending'
+                 ORDER BY tt.id",
+            )
+            .bind(now)
+            .fetch_all(db.tx().as_mut()),
+        )
+        .unwrap();
+        rows.iter().map(|r| r.get("id")).collect()
+    }
+
+    fn selected_lease_timeout_ids(db: &PostgresDb<'_>, now: i64) -> Vec<String> {
+        let rows = rt_block_on(
+            sqlx::query(
+                "SELECT tt.id FROM task_timeouts tt JOIN tasks t ON t.id = tt.id
+                 WHERE tt.timeout_type = 1 AND tt.timeout_at <= $1 AND t.state = 'acquired'
+                 ORDER BY tt.id",
+            )
+            .bind(now)
+            .fetch_all(db.tx().as_mut()),
+        )
+        .unwrap();
+        rows.iter().map(|r| r.get("id")).collect()
+    }
+
+    fn snapshot_timeout(snapshot: &Snapshot, id: &str) -> (i32, i64) {
+        let row = snapshot
+            .task_timeouts
+            .iter()
+            .find(|tt| tt.id == id)
+            .unwrap_or_else(|| panic!("missing task_timeout row for {id}"));
+        (row.timeout_type, row.timeout)
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settlement_resumes_suspended_awaiter_and_enqueues_execute() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let (after, snapshot, execute, unblock) = storage
+            .transact(|db| {
+                db.promise_create(&PromiseCreateParams {
+                    id: "awaited",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: "{}",
+                    timeout_at: 500,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    address: None,
+                })?;
+                db.task_create(&TaskCreateParams {
+                    promise_id: "awaiter",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: r#"{"resonate:target":"worker://tests"}"#,
+                    timeout_at: 600,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    ttl: 25,
+                    pid: "worker-1",
+                })?;
+                let suspended = db.task_suspend("awaiter", 0, &["awaited"])?;
+                assert!(suspended.was_suspended);
+                let settled = db.promise_settle(&PromiseSettleParams {
+                    id: "awaited",
+                    state: "resolved",
+                    value_headers: None,
+                    value_data: Some("done"),
+                    settled_at: 100,
+                })?;
+                assert!(settled.was_settled);
+                let after = db.task_get("awaiter")?.unwrap();
+                let snapshot = db.snap()?;
+                let (execute, unblock) = db.take_outgoing(10)?;
+                Ok((after, snapshot, execute, unblock))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(after.state, TaskState::Pending);
+        assert_eq!(after.version, 1);
+        assert_eq!(after.resumes, 1);
+        assert!(snapshot.listeners.is_empty());
+        assert_eq!(snapshot_timeout(&snapshot, "awaiter"), (0, 150));
+        assert!(unblock.is_empty());
+        assert_eq!(execute.len(), 1);
+        assert_eq!(execute[0].id, "awaiter");
+        assert_eq!(execute[0].version, 1);
+        assert_eq!(execute[0].address, "worker://tests");
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settlement_unblocks_registered_listeners() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let (snapshot, execute, unblock) = storage
+            .transact(|db| {
+                db.promise_create(&PromiseCreateParams {
+                    id: "awaited",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: "{}",
+                    timeout_at: 500,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    address: None,
+                })?;
+                db.promise_register_listener("awaited", "https://listener.test/hook")?;
+                db.promise_settle(&PromiseSettleParams {
+                    id: "awaited",
+                    state: "resolved",
+                    value_headers: None,
+                    value_data: Some("payload"),
+                    settled_at: 101,
+                })?;
+                let snapshot = db.snap()?;
+                let (execute, unblock) = db.take_outgoing(10)?;
+                Ok((snapshot, execute, unblock))
+            })
+            .await
+            .unwrap();
+
+        assert!(snapshot.listeners.is_empty());
+        let awaited = snapshot
+            .promises
+            .iter()
+            .find(|promise| promise.id == "awaited")
+            .unwrap();
+        assert_eq!(awaited.state, PromiseState::Resolved);
+        assert_eq!(awaited.value.data.as_deref(), Some("payload"));
+        assert!(execute.is_empty());
+        assert_eq!(unblock.len(), 1);
+        assert_eq!(unblock[0].address, "https://listener.test/hook");
+        assert_eq!(unblock[0].promise.id, "awaited");
+        assert_eq!(unblock[0].promise.state, PromiseState::Resolved);
+        assert_eq!(unblock[0].promise.value.data.as_deref(), Some("payload"));
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schedule_run_is_idempotent_and_advances_next_run() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let (updated, promise_count, timeout_count) = storage
+            .transact(|db| {
+                db.schedule_create(&ScheduleCreateParams {
+                    id: "sched",
+                    cron: "* * * * *",
+                    promise_id: "sched-{{.timestamp}}",
+                    promise_timeout: 500,
+                    promise_param_headers: None,
+                    promise_param_data: Some("body"),
+                    promise_tags: r#"{"env":"test"}"#,
+                    created_at: 0,
+                    next_run_at: 1_000,
+                })?;
+
+                let runs = vec![
+                    ScheduleRun {
+                        id: "sched-1000".to_string(),
+                        timeout_at: 1_500,
+                        created_at: 1_000,
+                    },
+                    ScheduleRun {
+                        id: "sched-2000".to_string(),
+                        timeout_at: 2_500,
+                        created_at: 2_000,
+                    },
+                ];
+
+                let updated = db.schedule_run("sched", 2_000, 3_000, &runs)?.unwrap();
+                db.schedule_run("sched", 2_000, 3_000, &runs)?;
+                let snapshot = db.snap()?;
+                let promise_count = snapshot
+                    .promises
+                    .iter()
+                    .filter(|promise| promise.id.starts_with("sched-"))
+                    .count();
+                let timeout_count = snapshot.promise_timeouts.len();
+                Ok((updated, promise_count, timeout_count))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(updated.last_run_at, Some(2_000));
+        assert_eq!(updated.next_run_at, 3_000);
+        assert_eq!(promise_count, 2);
+        assert_eq!(timeout_count, 2);
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_expired_schedules_includes_exactly_due_and_multiple_due_but_excludes_future() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let mut ids = storage
+            .transact(|db| {
+                for (id, next_run_at) in [("sched-a", 1_000), ("sched-b", 1_000), ("sched-future", 1_001)] {
+                    db.schedule_create(&ScheduleCreateParams {
+                        id,
+                        cron: "* * * * *",
+                        promise_id: "sched-{{.timestamp}}",
+                        promise_timeout: 500,
+                        promise_param_headers: None,
+                        promise_param_data: Some("body"),
+                        promise_tags: r#"{"env":"test"}"#,
+                        created_at: 0,
+                        next_run_at,
+                    })?;
+                }
+
+                let ids: Vec<String> = db
+                    .get_expired_schedules(1_000)?
+                    .into_iter()
+                    .map(|schedule| schedule.id)
+                    .collect();
+                Ok(ids)
+            })
+            .await
+            .unwrap();
+        ids.sort();
+
+        assert_eq!(ids, vec!["sched-a".to_string(), "sched-b".to_string()]);
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_all_timeouts_materializes_overdue_schedule_prefix() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let (schedule, promise_ids, timeout_count) = storage
+            .transact(|db| {
+                db.schedule_create(&ScheduleCreateParams {
+                    id: "sched",
+                    cron: "* * * * *",
+                    promise_id: "sched-{{.timestamp}}",
+                    promise_timeout: 500,
+                    promise_param_headers: None,
+                    promise_param_data: Some("body"),
+                    promise_tags: r#"{"env":"test"}"#,
+                    created_at: 0,
+                    next_run_at: 60_000,
+                })?;
+
+                process_all_timeouts(db, 180_000)?;
+
+                let schedule = db.schedule_get("sched")?.unwrap();
+                let snapshot = db.snap()?;
+                let mut promise_ids: Vec<_> = snapshot
+                    .promises
+                    .iter()
+                    .filter(|promise| promise.id.starts_with("sched-"))
+                    .map(|promise| promise.id.clone())
+                    .collect();
+                promise_ids.sort();
+                Ok((schedule, promise_ids, snapshot.promise_timeouts.len()))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(schedule.last_run_at, Some(180_000));
+        assert_eq!(schedule.next_run_at, 240_000);
+        assert_eq!(promise_ids, vec![
+            "sched-120000".to_string(),
+            "sched-180000".to_string(),
+            "sched-60000".to_string(),
+        ]);
+        assert_eq!(timeout_count, 3);
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_timeouts_batches_promise_retry_and_lease_effects() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let (awaited, awaiter, retry, lease, snapshot, mut execute, unblock) = storage
+            .transact(|db| {
+                db.promise_create(&PromiseCreateParams {
+                    id: "awaited-batch",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: "{}",
+                    timeout_at: 10,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    address: None,
+                })?;
+                db.promise_register_listener("awaited-batch", "https://listener.test/batch")?;
+
+                db.task_create(&TaskCreateParams {
+                    promise_id: "awaiter-batch",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: r#"{"resonate:target":"worker://awaiter"}"#,
+                    timeout_at: 1_000,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    ttl: 25,
+                    pid: "worker-a",
+                })?;
+                let suspended = db.task_suspend("awaiter-batch", 0, &["awaited-batch"])?;
+                assert!(suspended.was_suspended);
+
+                db.promise_create(&PromiseCreateParams {
+                    id: "retry-batch",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: r#"{"resonate:target":"worker://retry"}"#,
+                    timeout_at: 500,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    address: Some("worker://retry"),
+                })?;
+                let _ = db.take_outgoing(10)?;
+
+                db.task_create(&TaskCreateParams {
+                    promise_id: "lease-batch",
+                    state: "pending",
+                    param_headers: None,
+                    param_data: None,
+                    tags: r#"{"resonate:target":"worker://lease"}"#,
+                    timeout_at: 1_000,
+                    created_at: 0,
+                    settled_at: None,
+                    already_timedout: false,
+                    ttl: 20,
+                    pid: "worker-l",
+                })?;
+
+                db.process_timeouts(100)?;
+
+                let awaited = db.promise_get("awaited-batch")?.unwrap();
+                let awaiter = db.task_get("awaiter-batch")?.unwrap();
+                let retry = db.task_get("retry-batch")?.unwrap();
+                let lease = db.task_get("lease-batch")?.unwrap();
+                let snapshot = db.snap()?;
+                let (execute, unblock) = db.take_outgoing(10)?;
+                Ok((awaited, awaiter, retry, lease, snapshot, execute, unblock))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(awaited.state, PromiseState::RejectedTimedout);
+        assert_eq!(awaiter.state, TaskState::Pending);
+        assert_eq!(awaiter.version, 1);
+        assert_eq!(awaiter.resumes, 1);
+        assert_eq!(retry.state, TaskState::Pending);
+        assert_eq!(retry.version, 0);
+        assert_eq!(lease.state, TaskState::Pending);
+        assert_eq!(lease.version, 1);
+        assert!(snapshot.listeners.is_empty());
+        assert_eq!(snapshot_timeout(&snapshot, "awaiter-batch"), (0, 150));
+        assert_eq!(snapshot_timeout(&snapshot, "retry-batch"), (0, 150));
+        assert_eq!(snapshot_timeout(&snapshot, "lease-batch"), (0, 150));
+        assert!(snapshot.task_timeouts.iter().all(|tt| tt.timeout_type == 0));
+
+        execute.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(execute.len(), 3);
+        assert_eq!(execute[0].id, "awaiter-batch");
+        assert_eq!(execute[0].version, 1);
+        assert_eq!(execute[0].address, "worker://awaiter");
+        assert_eq!(execute[1].id, "lease-batch");
+        assert_eq!(execute[1].version, 1);
+        assert_eq!(execute[1].address, "worker://lease");
+        assert_eq!(execute[2].id, "retry-batch");
+        assert_eq!(execute[2].version, 0);
+        assert_eq!(execute[2].address, "worker://retry");
+
+        assert_eq!(unblock.len(), 1);
+        assert_eq!(unblock[0].address, "https://listener.test/batch");
+        assert_eq!(unblock[0].promise.id, "awaited-batch");
+        assert_eq!(unblock[0].promise.state, PromiseState::RejectedTimedout);
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_query_membership_matches_snapshot_predicates() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let tx = storage.pool.begin().await.unwrap();
+        let db = PostgresDb {
+            tx: UnsafeCell::new(tx),
+            task_retry_timeout: 50,
+        };
+
+        db.promise_create(&PromiseCreateParams {
+            id: "retry-due",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://retry-due"}"#,
+            timeout_at: 1_000,
+            created_at: 0,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://retry-due"),
+        })
+        .unwrap();
+        db.promise_create(&PromiseCreateParams {
+            id: "retry-future",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://retry-future"}"#,
+            timeout_at: 1_000,
+            created_at: 60,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://retry-future"),
+        })
+        .unwrap();
+        let _ = db.take_outgoing(10).unwrap();
+
+        db.promise_create(&PromiseCreateParams {
+            id: "lease-due",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://lease-due"}"#,
+            timeout_at: 1_000,
+            created_at: 0,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://lease-due"),
+        })
+        .unwrap();
+        db.promise_create(&PromiseCreateParams {
+            id: "lease-future",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://lease-future"}"#,
+            timeout_at: 1_000,
+            created_at: 0,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://lease-future"),
+        })
+        .unwrap();
+        let _ = db.take_outgoing(10).unwrap();
+        let acquired_due = db
+            .task_acquire(&TaskAcquireParams {
+                task_id: "lease-due",
+                version: 0,
+                time: 80,
+                ttl: 20,
+                pid: "worker-due",
+            })
+            .unwrap();
+        assert!(acquired_due.was_acquired);
+        let acquired_future = db
+            .task_acquire(&TaskAcquireParams {
+                task_id: "lease-future",
+                version: 0,
+                time: 81,
+                ttl: 20,
+                pid: "worker-future",
+            })
+            .unwrap();
+        assert!(acquired_future.was_acquired);
+
+        let snapshot = db.snap().unwrap();
+        let mut expected_retry: Vec<String> = snapshot
+            .task_timeouts
+            .iter()
+            .filter(|tt| tt.timeout_type == 0 && tt.timeout <= 100)
+            .filter(|tt| {
+                snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == tt.id)
+                    .map(|task| task.state == TaskState::Pending)
+                    .unwrap_or(false)
+            })
+            .map(|tt| tt.id.clone())
+            .collect();
+        expected_retry.sort();
+
+        let mut expected_lease: Vec<String> = snapshot
+            .task_timeouts
+            .iter()
+            .filter(|tt| tt.timeout_type == 1 && tt.timeout <= 100)
+            .filter(|tt| {
+                snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == tt.id)
+                    .map(|task| task.state == TaskState::Acquired)
+                    .unwrap_or(false)
+            })
+            .map(|tt| tt.id.clone())
+            .collect();
+        expected_lease.sort();
+
+        assert_eq!(selected_retry_timeout_ids(&db, 100), expected_retry);
+        assert_eq!(selected_lease_timeout_ids(&db, 100), expected_lease);
+    }
+
+    #[ignore = "requires RESONATE_TEST_POSTGRES_URL or local Postgres on 127.0.0.1:5432"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_timeouts_updates_due_rows_without_touching_future_timeout_rows() {
+        let _guard = postgres_test_lock().lock().unwrap();
+        let storage = postgres_test_storage().await;
+        let tx = storage.pool.begin().await.unwrap();
+        let db = PostgresDb {
+            tx: UnsafeCell::new(tx),
+            task_retry_timeout: 50,
+        };
+
+        db.promise_create(&PromiseCreateParams {
+            id: "retry-due",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://retry-due"}"#,
+            timeout_at: 1_000,
+            created_at: 0,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://retry-due"),
+        })
+        .unwrap();
+        db.promise_create(&PromiseCreateParams {
+            id: "retry-future",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://retry-future"}"#,
+            timeout_at: 1_000,
+            created_at: 60,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://retry-future"),
+        })
+        .unwrap();
+        let _ = db.take_outgoing(10).unwrap();
+
+        db.promise_create(&PromiseCreateParams {
+            id: "lease-due",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://lease-due"}"#,
+            timeout_at: 1_000,
+            created_at: 0,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://lease-due"),
+        })
+        .unwrap();
+        db.promise_create(&PromiseCreateParams {
+            id: "lease-future",
+            state: "pending",
+            param_headers: None,
+            param_data: None,
+            tags: r#"{"resonate:target":"worker://lease-future"}"#,
+            timeout_at: 1_000,
+            created_at: 0,
+            settled_at: None,
+            already_timedout: false,
+            address: Some("worker://lease-future"),
+        })
+        .unwrap();
+        let _ = db.take_outgoing(10).unwrap();
+
+        assert!(
+            db.task_acquire(&TaskAcquireParams {
+                task_id: "lease-due",
+                version: 0,
+                time: 80,
+                ttl: 20,
+                pid: "worker-due",
+            })
+            .unwrap()
+            .was_acquired
+        );
+        assert!(
+            db.task_acquire(&TaskAcquireParams {
+                task_id: "lease-future",
+                version: 0,
+                time: 81,
+                ttl: 20,
+                pid: "worker-future",
+            })
+            .unwrap()
+            .was_acquired
+        );
+        let _ = db.take_outgoing(10).unwrap();
+
+        let before = db.snap().unwrap();
+        assert_eq!(snapshot_timeout(&before, "retry-due"), (0, 50));
+        assert_eq!(snapshot_timeout(&before, "retry-future"), (0, 110));
+        assert_eq!(snapshot_timeout(&before, "lease-due"), (1, 100));
+        assert_eq!(snapshot_timeout(&before, "lease-future"), (1, 101));
+
+        db.process_timeouts(100).unwrap();
+
+        let retry_due = db.task_get("retry-due").unwrap().unwrap();
+        let retry_future = db.task_get("retry-future").unwrap().unwrap();
+        let lease_due = db.task_get("lease-due").unwrap().unwrap();
+        let lease_future = db.task_get("lease-future").unwrap().unwrap();
+        let after = db.snap().unwrap();
+
+        assert_eq!(snapshot_timeout(&after, "retry-due"), (0, 150));
+        assert_eq!(snapshot_timeout(&after, "retry-future"), (0, 110));
+        assert_eq!(snapshot_timeout(&after, "lease-due"), (0, 150));
+        assert_eq!(snapshot_timeout(&after, "lease-future"), (1, 101));
+
+        assert_eq!(retry_due.state, TaskState::Pending);
+        assert_eq!(retry_due.version, 0);
+        assert_eq!(retry_future.state, TaskState::Pending);
+        assert_eq!(retry_future.version, 0);
+        assert_eq!(lease_due.state, TaskState::Pending);
+        assert_eq!(lease_due.version, 1);
+        assert_eq!(lease_future.state, TaskState::Acquired);
+        assert_eq!(lease_future.version, 0);
+
+        let (mut execute, unblock) = db.take_outgoing(10).unwrap();
+        execute.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(execute.len(), 2);
+        assert_eq!(execute[0].id, "lease-due");
+        assert_eq!(execute[0].version, 1);
+        assert_eq!(execute[0].address, "worker://lease-due");
+        assert_eq!(execute[1].id, "retry-due");
+        assert_eq!(execute[1].version, 0);
+        assert_eq!(execute[1].address, "worker://retry-due");
+        assert!(unblock.is_empty());
     }
 }
