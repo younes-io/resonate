@@ -1,6 +1,9 @@
 mod auth;
 mod cli;
+mod dafny_timeout_batch;
 mod config;
+mod dafny_runtime_kernel;
+mod dafny_schedule_planner;
 
 mod metrics;
 mod persistence;
