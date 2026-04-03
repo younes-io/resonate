@@ -44,21 +44,25 @@ pub fn is_valid_cron(cron_expr: &str) -> bool {
 }
 
 /// Compute next cron occurrence after a given time (in ms).
-pub fn compute_next_cron(cron_expr: &str, after_ms: i64) -> i64 {
+pub fn try_compute_next_cron(cron_expr: &str, after_ms: i64) -> Option<i64> {
     use cron::Schedule;
     use std::str::FromStr;
 
     // cron crate expects 7-field expressions; spec uses 5-field (standard cron)
     let full_expr = format!("0 {}", cron_expr);
 
-    if let Ok(schedule) = Schedule::from_str(&full_expr) {
-        let after_secs = after_ms / 1000;
-        let after_dt = chrono::DateTime::from_timestamp(after_secs, 0)
-            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+    let schedule = Schedule::from_str(&full_expr).ok()?;
+    let after_secs = after_ms / 1000;
+    let after_dt = chrono::DateTime::from_timestamp(after_secs, 0)?;
+    let next = schedule.after(&after_dt).next()?;
 
-        if let Some(next) = schedule.after(&after_dt).next() {
-            return next.timestamp() * 1000;
-        }
+    Some(next.timestamp() * 1000)
+}
+
+/// Compute next cron occurrence after a given time (in ms).
+pub fn compute_next_cron(cron_expr: &str, after_ms: i64) -> i64 {
+    if let Some(next) = try_compute_next_cron(cron_expr, after_ms) {
+        return next;
     }
 
     tracing::error!(
