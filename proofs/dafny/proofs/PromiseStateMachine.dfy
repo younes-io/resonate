@@ -1,7 +1,9 @@
 include "../model/ResonateModel.dfy"
+include "../executable/RuntimeStateKernel.dfy"
 
 module ResonatePromiseStateMachineProofs {
   import M = ResonateModel
+  import K = RuntimeStateKernel
 
   lemma EmptyStateIsValid()
     ensures M.Valid(M.EmptyState())
@@ -112,5 +114,174 @@ module ResonatePromiseStateMachineProofs {
     ensures M.PromiseTerminal(s.promises[id].state)
   {
     assert id in s.promises;
+  }
+
+  lemma ExecutablePromiseCreateMatchesFreshModel(s: M.ResonateState, id: M.Id, timeoutAt: nat, timer: bool, hasTarget: bool, now: nat)
+    requires M.Valid(s)
+    requires id !in s.promises
+    ensures K.PromiseStateCode(K.CreatePromiseState(now, timeoutAt, timer)) ==
+      (if M.CreatePromise(s, id, timeoutAt, timer, hasTarget, now).promises[id].state == M.Pending then 0
+      else if M.CreatePromise(s, id, timeoutAt, timer, hasTarget, now).promises[id].state == M.Resolved then 1
+      else if M.CreatePromise(s, id, timeoutAt, timer, hasTarget, now).promises[id].state == M.Rejected then 2
+      else if M.CreatePromise(s, id, timeoutAt, timer, hasTarget, now).promises[id].state == M.RejectedCanceled then 3
+      else 4)
+    ensures K.CreatePromiseCreatedAt(now, timeoutAt) == if now >= timeoutAt then timeoutAt else now
+    ensures K.CreatePromiseHasSettled(now, timeoutAt) <==> now >= timeoutAt
+    ensures hasTarget ==> (K.CreatePromiseTaskState(now, timeoutAt) ==
+      (if now >= timeoutAt then K.Fulfilled else K.TaskPending))
+  {
+  }
+
+  lemma ExecutableSettlePromiseMatchesModel(s: M.ResonateState, id: M.Id, newState: M.PromiseState)
+    requires M.Valid(s)
+    requires id in s.promises
+    ensures K.PromiseStateCode(K.SettlePromiseState(
+      if s.promises[id].state == M.Pending then K.Pending
+      else if s.promises[id].state == M.Resolved then K.Resolved
+      else if s.promises[id].state == M.Rejected then K.Rejected
+      else if s.promises[id].state == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout,
+      if newState == M.Pending then K.Pending
+      else if newState == M.Resolved then K.Resolved
+      else if newState == M.Rejected then K.Rejected
+      else if newState == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout))
+      ==
+      (if M.SettlePromise(s, id, newState).promises[id].state == M.Pending then 0
+      else if M.SettlePromise(s, id, newState).promises[id].state == M.Resolved then 1
+      else if M.SettlePromise(s, id, newState).promises[id].state == M.Rejected then 2
+      else if M.SettlePromise(s, id, newState).promises[id].state == M.RejectedCanceled then 3
+      else 4)
+  {
+  }
+
+  lemma ExecutableAcquireTaskMatchesModel(s: M.ResonateState, id: M.Id, version: nat)
+    requires M.Valid(s)
+    requires id in s.tasks
+    ensures K.TaskStateCode(K.AcquireTaskState(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled,
+      s.tasks[id].version,
+      version))
+      ==
+      (if M.AcquireTask(s, id, version).tasks[id].state == M.TaskPending then 0
+      else if M.AcquireTask(s, id, version).tasks[id].state == M.Acquired then 1
+      else if M.AcquireTask(s, id, version).tasks[id].state == M.Suspended then 2
+      else if M.AcquireTask(s, id, version).tasks[id].state == M.Halted then 3
+      else 4)
+    ensures K.AcquireTaskVersion(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled,
+      s.tasks[id].version,
+      version) == M.AcquireTask(s, id, version).tasks[id].version
+  {
+  }
+
+  lemma ExecutableReleaseTaskMatchesModel(s: M.ResonateState, id: M.Id, version: nat)
+    requires M.Valid(s)
+    requires id in s.tasks
+    ensures K.ReleaseTaskVersion(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled,
+      s.tasks[id].version,
+      version) == M.ReleaseTask(s, id, version).tasks[id].version
+  {
+  }
+
+  lemma ExecutableFulfillTaskMatchesModel(s: M.ResonateState, id: M.Id, version: nat, newState: M.PromiseState)
+    requires M.Valid(s)
+    requires id in s.tasks
+    requires id in s.promises
+    ensures K.TaskStateCode(K.FulfillTaskState(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled,
+      s.tasks[id].version,
+      version,
+      if s.promises[id].state == M.Pending then K.Pending
+      else if s.promises[id].state == M.Resolved then K.Resolved
+      else if s.promises[id].state == M.Rejected then K.Rejected
+      else if s.promises[id].state == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout,
+      if newState == M.Pending then K.Pending
+      else if newState == M.Resolved then K.Resolved
+      else if newState == M.Rejected then K.Rejected
+      else if newState == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout))
+      ==
+      (if M.FulfillTask(s, id, version, newState).tasks[id].state == M.TaskPending then 0
+      else if M.FulfillTask(s, id, version, newState).tasks[id].state == M.Acquired then 1
+      else if M.FulfillTask(s, id, version, newState).tasks[id].state == M.Suspended then 2
+      else if M.FulfillTask(s, id, version, newState).tasks[id].state == M.Halted then 3
+      else 4)
+    ensures K.FulfillPromiseState(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled,
+      s.tasks[id].version,
+      version,
+      if s.promises[id].state == M.Pending then K.Pending
+      else if s.promises[id].state == M.Resolved then K.Resolved
+      else if s.promises[id].state == M.Rejected then K.Rejected
+      else if s.promises[id].state == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout,
+      if newState == M.Pending then K.Pending
+      else if newState == M.Resolved then K.Resolved
+      else if newState == M.Rejected then K.Rejected
+      else if newState == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout)
+      ==
+      (if M.FulfillTask(s, id, version, newState).promises[id].state == M.Pending then K.Pending
+      else if M.FulfillTask(s, id, version, newState).promises[id].state == M.Resolved then K.Resolved
+      else if M.FulfillTask(s, id, version, newState).promises[id].state == M.Rejected then K.Rejected
+      else if M.FulfillTask(s, id, version, newState).promises[id].state == M.RejectedCanceled then K.RejectedCanceled
+      else K.RejectedTimedout)
+    ensures s.tasks[id].version == M.FulfillTask(s, id, version, newState).tasks[id].version
+   {
+   }
+
+  lemma ExecutableHaltTaskMatchesModel(s: M.ResonateState, id: M.Id)
+    requires M.Valid(s)
+    requires id in s.tasks
+    ensures K.TaskStateCode(K.HaltTaskState(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled))
+      ==
+      (if M.HaltTask(s, id).tasks[id].state == M.TaskPending then 0
+      else if M.HaltTask(s, id).tasks[id].state == M.Acquired then 1
+      else if M.HaltTask(s, id).tasks[id].state == M.Suspended then 2
+      else if M.HaltTask(s, id).tasks[id].state == M.Halted then 3
+      else 4)
+    ensures s.tasks[id].version == M.HaltTask(s, id).tasks[id].version
+   {
+   }
+
+  lemma ExecutableContinueTaskMatchesModel(s: M.ResonateState, id: M.Id)
+    requires M.Valid(s)
+    requires id in s.tasks
+    ensures K.ContinueTaskVersion(
+      if s.tasks[id].state == M.TaskPending then K.TaskPending
+      else if s.tasks[id].state == M.Acquired then K.Acquired
+      else if s.tasks[id].state == M.Suspended then K.Suspended
+      else if s.tasks[id].state == M.Halted then K.Halted
+      else K.Fulfilled,
+      s.tasks[id].version) == M.ContinueTask(s, id).tasks[id].version
+  {
   }
 }

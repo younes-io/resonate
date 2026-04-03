@@ -1,7 +1,9 @@
 include "ResonateModel.dfy"
+include "../executable/SchedulePlannerKernel.dfy"
 
 module ResonateCoordinationModel {
   import Core = ResonateModel
+  import K = SchedulePlannerKernel
 
   type Id = Core.Id
   type Address = nat
@@ -416,6 +418,14 @@ module ResonateCoordinationModel {
     (forall i: nat :: i < |runs| ==> runs[i].createdAt <= now) &&
     (forall i: nat :: i + 1 < |runs| ==> runs[i].createdAt < runs[i + 1].createdAt) &&
     finalNextRunAt > now
+  }
+
+  predicate TrustedNextCronOracleStep(cron: string, current: nat, next: nat)
+
+  predicate TrustedSchedulePlannerInput(schedule: Schedule, cron: string, now: nat, candidates: seq<nat>) {
+    schedule.nextRunAt <= now &&
+    K.TrustedCronCandidateStream(schedule.nextRunAt, now, candidates) &&
+    forall i: nat :: i + 1 < |candidates| ==> TrustedNextCronOracleStep(cron, candidates[i], candidates[i + 1])
   }
 
   function ApplyScheduleRunPromises(core: Core.ResonateState, runs: seq<ScheduleRunRequest>): Core.ResonateState
