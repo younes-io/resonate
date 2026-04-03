@@ -9,6 +9,8 @@ FILES=(
   proofs/dafny/model/ResonateModel.dfy
   proofs/dafny/model/CoordinationModel.dfy
   proofs/dafny/model/StorageSpec.dfy
+  proofs/dafny/executable/SchedulePlannerKernel.dfy
+  proofs/dafny/executable/TimeoutBatchKernel.dfy
   proofs/dafny/proofs/PromiseStateMachine.dfy
   proofs/dafny/proofs/TimeoutProofs.dfy
   proofs/dafny/proofs/CoordinationProofs.dfy

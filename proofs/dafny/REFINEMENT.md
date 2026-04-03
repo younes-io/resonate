@@ -69,6 +69,27 @@ This refinement layer assumes some facts that are enforced elsewhere in the Rust
 
 ## Rust correspondence
 
+## Executable timeout-batch kernel boundary
+
+`executable/TimeoutBatchKernel.dfy` now adds an executable timeout-processing kernel beside the schedule/runtime kernels.
+
+- executable timeout kernel:
+  - mirrors the proved semantic nucleus for:
+    - timeout-batch phase ordering
+    - retry timeout re-enqueue row updates
+    - lease release + retry conversion row updates
+    - statement-1 ready-awaiter resumption and listener unblock effects
+  - exposes executable pure functions over a timeout-batch state + timeout-row pair plus an executable method contract (`PlanTimeoutBatch`) that computes the same post-batch state/row result for a deterministic ordered batch
+- proof bridge:
+  - `proofs/CoordinationProofs.dfy` now includes explicit executable bridge lemmas for:
+    - kernel phase order (`ExecutableTimeoutKernelPreservesPhaseOrder`)
+    - retry-row refinement (`ExecutableRetryTimeoutRowsRefineAbstractLaw`)
+    - lease-row refinement (`ExecutableLeaseTimeoutRowsRefineAbstractLaw`)
+    - statement-1 ready-awaiter and listener-unblock refinement (`ExecutableStatement1ReadyAwaiterRefinesAbstractLaw`, `ExecutableStatement1ListenerUnblockRefinesAbstractLaw`)
+- live runtime validation:
+  - `src/dafny_timeout_batch.rs` projects the live Rust timeout snapshot into the executable kernel, runs the compiled DLL, and validates the real post-`process_timeouts` result against the kernel before schedule processing continues
+  - `src/processing/processing_timeouts.rs::process_all_timeouts` now performs that validation on the live timeout path for both SQLite and Postgres backends because it runs inside the shared transaction wrapper with access to `snap()` before and after `db.process_timeouts(time)`
+
 ### SQLite
 
 `src/persistence/persistence_sqlite.rs::process_timeouts`
@@ -112,17 +133,57 @@ The schedule boundary covered by the current model is intentionally narrower tha
   - the abstract contract is set membership, not backend row ordering
   - a not-yet-due schedule (`next_run_at > now`) is out of the selected set
 - exhausted-prefix materialization:
-  - once a due schedule is selected, the runtime repeatedly applies the trusted one-step cron advancement until it reaches the first strictly future cron instant
+  - once a due schedule is selected, the runtime now generates a bounded increasing candidate stream using a checked trusted one-step cron advancement and passes that stream into the executable Dafny planner kernel in `proofs/dafny/executable/SchedulePlannerKernel.dfy`
+  - that compiled Dafny kernel now has an explicit verified contract over the candidate stream:
+    - `TrustedCronCandidateStream` names the schedule-anchored input shape the executable kernel consumes: the stream starts at the persisted `next_run_at` and already satisfies the increasing / future-boundary conditions consumed by the kernel
+    - `ValidScheduleCandidateStream` describes the trusted runtime input shape
+    - `PlannedRunTimes` is the exhausted due prefix selected from that stream
+    - `PlannedFinalNextRunAt` is the first strictly future cron instant after that prefix
+    - `ValidStreamPlannedBoundary` proves those pure outputs satisfy the executable kernel's exhausted-prefix boundary predicate
+  - `model/CoordinationModel.dfy` now exposes `TrustedSchedulePlannerInput`, which ties that stream to a due schedule state (`schedule.nextRunAt <= now`) and explicitly records the remaining per-step oracle trust (`TrustedNextCronOracleStep`) before refinement into the abstract schedule batch laws
+  - `proofs/CoordinationProofs.dfy` then closes the model-level link:
+    - `ExecutablePlannerRefinesExhaustedRunPrefix` lifts the executable kernel boundary into `CoordinationModel.ExhaustedRunPrefix`
+    - `ExecutablePlannerAdvanceBatchFromDueSchedule` uses that refined prefix to justify `ScheduleRunBatch` and its post-state (`hasRun`, `lastRunAt`, `nextRunAt`)
+    - `TrustedSchedulePlannerInputAdvanceBatchFromDueSchedule` makes the schedule-anchored trusted input contract explicit: if Rust supplies a due schedule plus a trusted cron-step candidate stream, the executable planner and abstract batch laws take over from there
   - every realized due instant in that exhausted prefix produces one run promise with `created_at` equal to the realized instant and `timeout_at = created_at + promise_timeout`
-  - the batch post-state records `last_run_at` as the last realized due instant and `next_run_at` as the first strictly future instant after the exhausted prefix
+  - the batch post-state records `last_run_at` as the last realized due instant and `next_run_at` as the first strictly future instant after the exhausted prefix returned by the Dafny planner
 - `hasRun` mapping:
   - Dafny uses `hasRun` as the semantic bit for whether any run has been materialized
   - Rust persists that same boundary via `last_run_at`: `hasRun == false` corresponds to `last_run_at == None`, and a non-empty run batch corresponds to `last_run_at == Some(last realized run)`
 
+## Executable runtime transition kernels
+
+`executable/RuntimeStateKernel.dfy` now adds a second executable layer beside the schedule planner.
+
+- promise/task transition kernel:
+  - executable pure transitions mirror the proved `ResonateModel` nucleus for:
+    - promise create timing (`pending` vs already-timedout terminal creation shape)
+    - promise settlement
+    - task acquire
+    - task release
+    - task fulfill
+    - task halt
+    - task continue
+  - `proofs/PromiseStateMachine.dfy` now includes lightweight refinement lemmas tying those executable transition summaries back to the model-level operators instead of replacing them
+  - `src/dafny_runtime_kernel.rs` calls the compiled kernel and `src/server.rs` uses it on live request paths to:
+    - compute the promise-create boundary shared by `promise.create`, `task.create`, and `task.fence` create
+    - validate successful promise/task transitions against the executable kernel before returning success
+- schedule-state kernel:
+  - executable schedule create / advance summaries mirror the proved coordination-level schedule state boundary (`hasRun`, `lastRunAt`, `nextRunAt`, `promiseTimeout`)
+  - `proofs/CoordinationProofs.dfy` records the corresponding executable schedule boundary facts alongside the existing planner refinement
+  - Rust uses that kernel on live paths in:
+    - `src/server.rs::op_schedule_create`
+    - `src/processing/processing_timeouts.rs::process_schedule_timeouts`
+  - the scheduler still trusts Rust for cron stepping and persistence effects, but the schedule record boundary returned to Rust is now checked by executable Dafny both at create time and after a realized run batch
+
 ## Trusted assumptions and non-goals
 
 - trusted assumptions:
-  - `util::compute_next_cron` is the trusted one-step runtime cron advancement used to exhaust the due prefix
+- `util::try_compute_next_cron` remains the trusted one-step runtime cron advancement used to generate the candidate stream consumed by the executable Dafny planner; this cut narrows that trust to successful one-step oracle outputs rather than also trusting the adapter's fallback shaping logic
+  - the minute-granularity lower bound (`MIN_CRON_SPACING_MS = 60_000`) is still trusted when Rust bounds how many oracle steps are needed to reach a future boundary for 5-field cron schedules
+  - `src/dafny_schedule_planner.rs`, `src/dafny_runtime_kernel.rs`, and `src/dafny_timeout_batch.rs` remain trusted Rust adapters for scalar encoding/decoding and invoking the compiled Dafny artifacts via `dotnet`
+  - the timeout-batch live validator trusts the Rust snapshot projection boundary: promise/task/callback/listener/outgoing/timeout-row facts taken from `snap()` are assumed to faithfully encode the semantic timeout state consumed by the executable kernel
+  - the timeout-batch live validator also trusts the batch-local string-to-`nat` tokenization used to feed runtime promise IDs and listener addresses into the Dafny kernel; the proof bridge reasons over the tokenized semantic shape rather than over raw string identities
   - SQLite/Postgres transaction semantics preserve the observable batch effects once `get_expired_schedules` and `schedule_run` are called
   - backend `get_expired_schedules` surfaces the due set according to the documented `next_run_at <= now` rule
 - non-goals for this cut:
@@ -183,6 +244,22 @@ Current Dafny proofs establish:
   - `DueSchedulesAt` models the backend due-selection rule as `nextRunAt <= now`
   - an abstract exhausted due prefix is sufficient to justify `ScheduleRunBatch`
   - the resulting schedule post-state matches the runtime boundary shape: last realized due run in `lastRunAt`, first future cron instant in `nextRunAt`
+- executable schedule-planner kernel laws showing:
+  - `SchedulePlannerKernel.dfy` verifies both:
+    - a pure candidate-stream boundary (`PlannedRunTimes` / `PlannedFinalNextRunAt`)
+    - the compiled executable method contract `PlanScheduleBatch` that returns that same boundary for valid runtime inputs
+  - `ExecutablePlannerRefinesExhaustedRunPrefix` and `ExecutablePlannerAdvanceBatchFromDueSchedule` connect that executable kernel contract to the abstract `ExhaustedRunPrefix` / `ScheduleRunBatch` schedule laws
+  - `src/dafny_schedule_planner.rs` executes the compiled Dafny kernel during `process_schedule_timeouts`, validates that the returned batch still matches the trusted candidate prefix and future-boundary shape, and now rejects invalid/non-computable cron steps instead of silently accepting the fallback path while materializing `ScheduleRun`s with the expected `created_at` / `timeout_at` mapping
+- executable runtime-state kernel laws showing:
+  - `RuntimeStateKernel.dfy` verifies executable summaries for promise/task state transitions and schedule create/advance post-state updates
+  - `proofs/PromiseStateMachine.dfy` keeps the abstract model as the semantic source of truth and adds executable refinement lemmas for fresh promise creation, settlement, acquire/release, and continue-style version updates
+  - `proofs/CoordinationProofs.dfy` records the executable schedule create/advance boundary facts used by the Rust adapter
+  - `src/server.rs` now uses the executable kernel on successful live request paths for promise create/settle and task acquire/release/fulfill/halt/continue, while `task.create`, `task.fence` create, and `schedule.create` reuse the executable promise/schedule planning boundary without moving SQL or transport effects into Dafny
+  - `src/processing/processing_timeouts.rs` now checks the post-`schedule_run` schedule state against the executable Dafny schedule-advance kernel before accepting the updated record
+- executable timeout-batch kernel laws showing:
+  - `TimeoutBatchKernel.dfy` verifies an executable timeout-batch state/row transformer plus an executable method contract over deterministic ordered timeout batches
+  - `proofs/CoordinationProofs.dfy` now records explicit executable refinement lemmas for phase order, retry-row refresh, lease-row conversion, ready-awaiter resumption, and listener unblock
+  - `src/dafny_timeout_batch.rs` runs that kernel against the live `snap()` projection and rejects mismatched runtime timeout batches before schedule processing continues
 
 ## Replay terminology boundary
 
@@ -194,7 +271,8 @@ We do not yet model a general replay subsystem. For the current kernel, the prec
 - proof that the concrete SQL queries materialize the same `TimeoutRows` object exactly
 - order-independence for arbitrary batches with duplicates
 - schedule processing as part of one unified refinement theorem
-- proof of the cron library itself or of malformed/exhausted schedule handling beyond the trusted boundary above
+- task.create / task.suspend / task.fence as full executable end-to-end kernels rather than mixed Rust orchestration around executable sub-boundaries
+- proof of the cron library itself, of the per-step oracle relation used by the Rust candidate-stream constructor, or of malformed/exhausted schedule handling beyond the trusted boundary above
 
 ## Runtime evidence
 
@@ -204,6 +282,15 @@ Repository tests backstop the abstraction:
 - the timeout-batch conformance test now asserts the exact post-batch `task_timeouts(timeout_type, timeout_at)` values for resumed/retried/released tasks
 - the due-vs-future timeout conformance test now checks that due rows are updated while future retry/lease rows remain untouched
 - the SQLite/Postgres runtime conformance tests now also assert the exact `outgoing_execute.address` and version values for resumed, retried, and released tasks
+- dedicated timeout-kernel adapter tests now also assert:
+  - a projected mixed timeout batch validates successfully against the executable kernel
+  - a mismatched lease-release version is rejected by the executable kernel validator
+- the schedule-processing runtime path now exercises the compiled Dafny planner binary before calling `schedule_run`
+- planner adapter unit tests now also check that materialized runs preserve the abstract batch meaning at the Rust boundary:
+  - `created_at` equals the realized due instant returned by the planner
+  - `timeout_at` equals `created_at + promise_timeout`
+  - the promise ID template is instantiated from the selected run instant
+  - candidate-stream construction now rejects invalid cron input, non-advancing oracle steps, and bounded streams that fail to reach a strictly future boundary
 - the direct settlement tests now also assert statement-1 snapshot effects:
   - resumed awaiters get the expected retry timeout row
   - settled promises disappear from the live listener set while preserving the resolved payload in snapshots

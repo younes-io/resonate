@@ -37,9 +37,15 @@ Resonate's Rust runtime mixes durable state transitions with external effects su
 - `proofs/TimeoutProofs.dfy`
   - proves invariant preservation for timeout-driven transitions inspired by `src/processing/processing_timeouts.rs`
 - `model/CoordinationModel.dfy`
-  - abstracts callbacks, listeners, resumptions, outgoing notifications, schedule state, timeout-batch processing, named backend statement phases, backend-shaped timeout-row/timeout-query selectors, abstract batch-membership predicates, and modeled `task_timeouts.timeout_at` rows for retry/lease queries
+  - abstracts callbacks, listeners, resumptions, outgoing notifications, schedule state, timeout-batch processing, named backend statement phases, backend-shaped timeout-row/timeout-query selectors, abstract batch-membership predicates, modeled `task_timeouts.timeout_at` rows for retry/lease queries, and the schedule-anchored trusted planner-input boundary including the explicit per-step cron-oracle assumption
+- `executable/SchedulePlannerKernel.dfy`
+  - compiles an executable planner that consumes a trusted schedule-anchored cron-candidate stream shape (`TrustedCronCandidateStream`) and exposes verified pure boundary functions (`PlannedRunTimes`, `PlannedFinalNextRunAt`) plus an executable method contract for the exhausted due-prefix boundary used by `process_schedule_timeouts`
+- `executable/RuntimeStateKernel.dfy`
+  - compiles executable promise/task transition and schedule-state kernels that mirror the proved model-level transition rules used for promise creation/settlement, task acquire/release/fulfill/halt/continue, and schedule create/advance post-state validation
+- `executable/TimeoutBatchKernel.dfy`
+  - compiles an executable timeout-batch kernel that mirrors the proved timeout phase order plus the retry-row, lease-row, ready-awaiter, listener-unblock, and outgoing-execute semantic boundary used by live timeout processing
 - `proofs/CoordinationProofs.dfy`
-  - proves preservation and progress laws for callback/listener notification, timeout batches, backend-phase/row-effect refinement equalities, backend-specific statement-1 listener-unblock/resume-enqueue effects, backend-specific selected-row/future-row timeout effects, backend-specific outgoing-execute version effects, exact timeout-row update laws, time-aware query-shape predicates, full duplicate-free ready/retry/lease permutations, independent promise-timeout permutations, and schedule execution
+  - proves preservation and progress laws for callback/listener notification, timeout batches, backend-phase/row-effect refinement equalities, backend-specific statement-1 listener-unblock/resume-enqueue effects, backend-specific selected-row/future-row timeout effects, backend-specific outgoing-execute version effects, exact timeout-row update laws, time-aware query-shape predicates, full duplicate-free ready/retry/lease permutations, independent promise-timeout permutations, schedule execution, the executable timeout-kernel bridge for phase order / retry / lease / statement-1 semantics, and the refinement bridge from the explicit trusted schedule-planner input contract into the abstract schedule batch semantics
 - `REFINEMENT.md`
   - maps the abstract timeout-batch model onto the SQLite/Postgres `process_timeouts` implementations
 
@@ -73,6 +79,9 @@ dotnet tool run dafny verify \
   proofs/dafny/model/ResonateModel.dfy \
   proofs/dafny/model/CoordinationModel.dfy \
   proofs/dafny/model/StorageSpec.dfy \
+  proofs/dafny/executable/SchedulePlannerKernel.dfy \
+  proofs/dafny/executable/TimeoutBatchKernel.dfy \
+  proofs/dafny/executable/RuntimeStateKernel.dfy \
   proofs/dafny/proofs/PromiseStateMachine.dfy \
   proofs/dafny/proofs/TimeoutProofs.dfy \
   proofs/dafny/proofs/CoordinationProofs.dfy
@@ -89,6 +98,7 @@ The script uses `RESONATE_TEST_POSTGRES_URL` if provided. Otherwise it first tri
 a direct disposable Docker Postgres container with a host-mounted data directory.
 
 ## Next likely expansions
-- stronger schedule proofs for multi-run batches rather than one-step schedule updates
+- tighten the current timeout-batch executable boundary from snapshot-based live validation toward a smaller trusted projection/tokenization surface or direct backend-produced semantic summaries
+- a proof-producing or independently checked account of the trusted one-step cron oracle itself, rather than the current explicit assumption that each successful `util::compute_next_cron` edge is correct
 - differential/property tests that check Rust backends against the abstract Dafny contract more exhaustively
 - a tighter refinement argument showing the concrete SQL updates materialize the modeled timeout-row timestamps exactly
