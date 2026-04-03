@@ -608,6 +608,7 @@ pub struct SnapshotPromiseTimeout {
 pub struct SnapshotCallback {
     pub awaiter: String,
     pub awaited: String,
+    pub ready: bool,
 }
 
 #[derive(Debug, Serialize)]

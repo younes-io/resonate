@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::auth;
 use crate::config::Config;
+use crate::dafny_runtime_kernel;
 use crate::metrics;
 use crate::persistence::{
     PromiseCreateParams, PromiseSettleParams, ScheduleCreateParams, Storage, TaskAcquireParams,
@@ -487,17 +488,9 @@ async fn op_promise_create(
             }
             db.try_timeout(&[&r.id], now)?;
             let tags_json = serde_json::to_string(&r.tags).unwrap();
-            let already_timedout = now >= r.timeout_at;
-            let (state, created_at, settled_at) = if already_timedout {
-                let state = if r.tags.get("resonate:timer").map(|v| v.as_str()) == Some("true") {
-                    PromiseState::Resolved
-                } else {
-                    PromiseState::RejectedTimedout
-                };
-                (state, r.timeout_at, Some(r.timeout_at))
-            } else {
-                (PromiseState::Pending, now, None)
-            };
+            let timer = r.tags.get("resonate:timer").map(|v| v.as_str()) == Some("true");
+            let create_plan =
+                dafny_runtime_kernel::plan_promise_create(now, r.timeout_at, timer, address.is_some())?;
             let param_headers_json = r
                 .param
                 .headers
@@ -505,16 +498,17 @@ async fn op_promise_create(
                 .map(|h| serde_json::to_string(h).unwrap());
             let promise = db.promise_create(&PromiseCreateParams {
                 id: &r.id,
-                state: state.as_str(),
+                state: create_plan.promise_state.as_str(),
                 param_headers: param_headers_json.as_deref(),
                 param_data: r.param.data.as_deref(),
                 tags: &tags_json,
                 timeout_at: r.timeout_at,
-                created_at,
-                settled_at,
-                already_timedout,
+                created_at: create_plan.created_at,
+                settled_at: create_plan.settled_at,
+                already_timedout: create_plan.settled_at.is_some(),
                 address,
             })?;
+            dafny_runtime_kernel::validate_promise_create_result(&create_plan, &promise)?;
             Ok(ResponseEnvelope::success(
                 kind_str.clone(),
                 corr_id.clone(),
@@ -564,6 +558,8 @@ async fn op_promise_settle(
                 ));
             }
             db.try_timeout(&[&r.id], now)?;
+            let before = db.promise_get(&r.id)?;
+            let before_task = db.task_get(&r.id)?;
             let value_headers_json = r
                 .value
                 .headers
@@ -587,6 +583,20 @@ async fn op_promise_settle(
                             404,
                             "Promise not found",
                         ));
+                    }
+                    if result.was_settled {
+                        if let Some(before_promise) = before.as_ref() {
+                            let settle_plan = dafny_runtime_kernel::plan_promise_settle(
+                                before_promise.state,
+                                r.state.to_promise_state(),
+                                before_task.as_ref(),
+                            )?;
+                            dafny_runtime_kernel::validate_promise_settle_result(
+                                &settle_plan,
+                                &promise,
+                                db.task_get(&r.id)?.as_ref(),
+                            )?;
+                        }
                     }
                     Ok(ResponseEnvelope::success(
                         kind_str.clone(),
@@ -934,22 +944,9 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
             }
             db.try_timeout(&[action_id], now)?;
             let tags_json = serde_json::to_string(&action_data.tags).unwrap();
-            let already_timedout = now >= action_data.timeout_at;
-            let (p_state, created_at, settled_at) = if already_timedout {
-                let p_state =
-                    if action_data.tags.get("resonate:timer").map(|v| v.as_str()) == Some("true") {
-                        PromiseState::Resolved
-                    } else {
-                        PromiseState::RejectedTimedout
-                    };
-                (
-                    p_state,
-                    action_data.timeout_at,
-                    Some(action_data.timeout_at),
-                )
-            } else {
-                (PromiseState::Pending, now, None)
-            };
+            let timer = action_data.tags.get("resonate:timer").map(|v| v.as_str()) == Some("true");
+            let create_plan =
+                dafny_runtime_kernel::plan_promise_create(now, action_data.timeout_at, timer, true)?;
             let param_headers_json = action_data
                 .param
                 .headers
@@ -957,14 +954,14 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
                 .map(|h| serde_json::to_string(h).unwrap());
             let result = db.task_create(&TaskCreateParams {
                 promise_id: action_id,
-                state: p_state.as_str(),
+                state: create_plan.promise_state.as_str(),
                 param_headers: param_headers_json.as_deref(),
                 param_data: action_data.param.data.as_deref(),
                 tags: &tags_json,
                 timeout_at: action_data.timeout_at,
-                created_at,
-                settled_at,
-                already_timedout,
+                created_at: create_plan.created_at,
+                settled_at: create_plan.settled_at,
+                already_timedout: create_plan.settled_at.is_some(),
                 ttl: r.ttl,
                 pid: &r.pid,
             })?;
@@ -980,6 +977,7 @@ async fn op_task_create(state: &Arc<Server>, req: &RequestEnvelope, now: i64) ->
 
             // CTE did the mutations (insert/acquire). Now read the final state.
             let promise = db.promise_get(action_id)?.unwrap_or(res.promise);
+            dafny_runtime_kernel::validate_promise_create_result(&create_plan, &promise)?;
             let task = db.task_get(action_id)?;
             let preload = db.compute_preload(action_id)?;
 
@@ -1082,6 +1080,7 @@ async fn op_task_acquire(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                 ));
             }
             db.try_timeout(&[&r.id], now)?;
+            let before_task = db.task_get(&r.id)?;
             let result = db.task_acquire(&TaskAcquireParams {
                 task_id: &r.id,
                 version: r.version,
@@ -1125,6 +1124,18 @@ async fn op_task_acquire(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                         ));
                     }
                     let task = db.task_get(&r.id)?.unwrap();
+                    if let Some(before_task) = before_task.as_ref() {
+                        let plan = dafny_runtime_kernel::plan_task_acquire(
+                            before_task.state,
+                            before_task.version,
+                            r.version,
+                        )?;
+                        dafny_runtime_kernel::validate_task_transition_result(
+                            "task-acquire",
+                            &plan,
+                            &task,
+                        )?;
+                    }
                     let preload = db.compute_preload(&r.id)?;
                     Ok(ResponseEnvelope::success(
                         kind_str.clone(),
@@ -1204,6 +1215,7 @@ async fn op_task_release(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     "Version mismatch",
                 ));
             }
+            let plan = dafny_runtime_kernel::plan_task_release(task.state, task.version, r.version)?;
             let released = db.task_release(&r.id, r.version, now, db.task_retry_timeout())?;
             if !released {
                 return Ok(ResponseEnvelope::error(
@@ -1213,6 +1225,12 @@ async fn op_task_release(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     "Task version mismatch or invalid state",
                 ));
             }
+            let updated = db.task_get(&r.id)?.ok_or_else(|| {
+                crate::persistence::StorageError::Backend(
+                    "task.release succeeded but task disappeared".to_string(),
+                )
+            })?;
+            dafny_runtime_kernel::validate_task_transition_result("task-release", &plan, &updated)?;
             Ok(ResponseEnvelope::new(
                 kind_str.clone(),
                 corr_id.clone(),
@@ -1287,6 +1305,17 @@ async fn op_task_fulfill(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                     "Version mismatch",
                 ));
             }
+            let promise_before = db.promise_get(&r.id)?.ok_or_else(|| {
+                crate::persistence::StorageError::Backend(
+                    "task.fulfill found task without promise".to_string(),
+                )
+            })?;
+            let fulfill_plan = dafny_runtime_kernel::plan_task_fulfill(
+                &task,
+                r.version,
+                promise_before.state,
+                action_data.state.to_promise_state(),
+            )?;
             let value_headers_json = action_data
                 .value
                 .headers
@@ -1310,11 +1339,23 @@ async fn op_task_fulfill(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -
                 ));
             }
             match result.promise {
-                Some(promise) => Ok(ResponseEnvelope::success(
-                    kind_str.clone(),
-                    corr_id.clone(),
-                    &TaskFulfillResponseData { promise },
-                )),
+                Some(promise) => {
+                    let updated_task = db.task_get(&r.id)?.ok_or_else(|| {
+                        crate::persistence::StorageError::Backend(
+                            "task.fulfill succeeded but task disappeared".to_string(),
+                        )
+                    })?;
+                    dafny_runtime_kernel::validate_task_fulfill_result(
+                        &fulfill_plan,
+                        &updated_task,
+                        &promise,
+                    )?;
+                    Ok(ResponseEnvelope::success(
+                        kind_str.clone(),
+                        corr_id.clone(),
+                        &TaskFulfillResponseData { promise },
+                    ))
+                }
                 None => Ok(ResponseEnvelope::error(
                     kind_str.clone(),
                     corr_id.clone(),
@@ -1483,7 +1524,6 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         ));
                     }
                     let tags_json = serde_json::to_string(&create_data.tags).unwrap();
-                    let already_timedout = now >= create_data.timeout_at;
                     let address = create_data.tags.get("resonate:target").map(|s| s.as_str());
                     if let Some(addr) = address {
                         if !crate::transport::is_valid_address(addr) {
@@ -1495,22 +1535,14 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                             ));
                         }
                     }
-                    let (p_state, created_at, settled_at) = if already_timedout {
-                        let p_state = if create_data.tags.get("resonate:timer").map(|v| v.as_str())
-                            == Some("true")
-                        {
-                            PromiseState::Resolved
-                        } else {
-                            PromiseState::RejectedTimedout
-                        };
-                        (
-                            p_state,
-                            create_data.timeout_at,
-                            Some(create_data.timeout_at),
-                        )
-                    } else {
-                        (PromiseState::Pending, now, None)
-                    };
+                    let timer =
+                        create_data.tags.get("resonate:timer").map(|v| v.as_str()) == Some("true");
+                    let create_plan = dafny_runtime_kernel::plan_promise_create(
+                        now,
+                        create_data.timeout_at,
+                        timer,
+                        address.is_some(),
+                    )?;
                     let param_headers_json = create_data
                         .param
                         .headers
@@ -1520,14 +1552,14 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         task_id: &r.id,
                         version: r.version,
                         promise_id: &create_data.id,
-                        state: p_state.as_str(),
+                        state: create_plan.promise_state.as_str(),
                         param_headers: param_headers_json.as_deref(),
                         param_data: create_data.param.data.as_deref(),
                         tags: &tags_json,
                         timeout_at: create_data.timeout_at,
-                        created_at,
-                        settled_at,
-                        already_timedout,
+                        created_at: create_plan.created_at,
+                        settled_at: create_plan.settled_at,
+                        already_timedout: create_plan.settled_at.is_some(),
                         address,
                     })?;
                     if !result.task_exists {
@@ -1547,6 +1579,9 @@ async fn op_task_fence(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> 
                         ));
                     }
                     let inner_status = if result.promise.is_some() { 200 } else { 404 };
+                    if let Some(promise) = result.promise.as_ref() {
+                        dafny_runtime_kernel::validate_promise_create_result(&create_plan, promise)?;
+                    }
                     let inner_data = match &result.promise {
                         Some(p) => serde_json::json!({ "promise": p }),
                         None => serde_json::json!("Promise not found"),
@@ -1736,6 +1771,7 @@ async fn op_task_halt(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> R
                 ));
             }
             db.try_timeout(&[&r.id], now)?;
+            let before_task = db.task_get(&r.id)?;
             let result = db.task_halt(&r.id)?;
             if !result.task_exists {
                 Ok(ResponseEnvelope::error(
@@ -1752,6 +1788,20 @@ async fn op_task_halt(state: &Arc<Server>, req: &RequestEnvelope, now: i64) -> R
                     "Task is fulfilled",
                 ))
             } else {
+                if let Some(before_task) = before_task.as_ref() {
+                    let plan =
+                        dafny_runtime_kernel::plan_task_halt(before_task.state, before_task.version)?;
+                    let updated = db.task_get(&r.id)?.ok_or_else(|| {
+                        crate::persistence::StorageError::Backend(
+                            "task.halt completed but task disappeared".to_string(),
+                        )
+                    })?;
+                    dafny_runtime_kernel::validate_task_transition_result(
+                        "task-halt",
+                        &plan,
+                        &updated,
+                    )?;
+                }
                 Ok(ResponseEnvelope::new(
                     kind_str.clone(),
                     corr_id.clone(),
@@ -1803,6 +1853,7 @@ async fn op_task_continue(
                 ));
             }
             db.try_timeout(&[&r.id], now)?;
+            let before_task = db.task_get(&r.id)?;
             let result = db.task_continue(&r.id, now)?;
             match result.state {
                 None => Ok(ResponseEnvelope::error(
@@ -1813,6 +1864,22 @@ async fn op_task_continue(
                 )),
                 Some(_state) => {
                     if result.continued {
+                        if let Some(before_task) = before_task.as_ref() {
+                            let plan = dafny_runtime_kernel::plan_task_continue(
+                                before_task.state,
+                                before_task.version,
+                            )?;
+                            let updated = db.task_get(&r.id)?.ok_or_else(|| {
+                                crate::persistence::StorageError::Backend(
+                                    "task.continue succeeded but task disappeared".to_string(),
+                                )
+                            })?;
+                            dafny_runtime_kernel::validate_task_transition_result(
+                                "task-continue",
+                                &plan,
+                                &updated,
+                            )?;
+                        }
                         Ok(ResponseEnvelope::new(
                             kind_str.clone(),
                             corr_id.clone(),
@@ -2010,6 +2077,8 @@ async fn op_schedule_create(
             }
             let promise_tags_json = serde_json::to_string(&r.promise_tags).unwrap();
             let next_run_at = util::compute_next_cron(&r.cron, now);
+            let create_plan =
+                dafny_runtime_kernel::plan_schedule_create(next_run_at, r.promise_timeout)?;
             let promise_param_headers_json = r
                 .promise_param
                 .headers
@@ -2026,6 +2095,7 @@ async fn op_schedule_create(
                 created_at: now,
                 next_run_at,
             })?;
+            dafny_runtime_kernel::validate_schedule_create_result(&create_plan, &schedule)?;
             Ok(ResponseEnvelope::success(
                 kind_str.clone(),
                 corr_id.clone(),
