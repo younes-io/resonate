@@ -1,0 +1,4 @@
+includes = ["model/*.dfy", "proofs/*.dfy"]
+
+[options]
+verification-time-limit = 60
