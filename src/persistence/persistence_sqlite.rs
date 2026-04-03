@@ -1465,7 +1465,9 @@ impl<'a> Db for SqliteDb<'a> {
             r
         };
 
-        let mut stmt = conn.prepare("SELECT awaiter_id, awaited_id FROM callbacks WHERE NOT ready ORDER BY awaiter_id, awaited_id")?;
+        let mut stmt = conn.prepare(
+            "SELECT awaiter_id, awaited_id, ready FROM callbacks ORDER BY awaiter_id, awaited_id",
+        )?;
         let callbacks: Vec<SnapshotCallback> = {
             let mut rows = stmt.query([])?;
             let mut r = Vec::new();
@@ -1473,6 +1475,7 @@ impl<'a> Db for SqliteDb<'a> {
                 r.push(SnapshotCallback {
                     awaiter: row.get(0)?,
                     awaited: row.get(1)?,
+                    ready: row.get(2)?,
                 });
             }
             r

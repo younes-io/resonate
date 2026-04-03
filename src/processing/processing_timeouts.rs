@@ -6,8 +6,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::dafny_timeout_batch;
+use crate::dafny_runtime_kernel;
+use crate::dafny_schedule_planner;
 use crate::metrics;
-use crate::persistence::{Db, ScheduleRun, StorageResult};
+use crate::persistence::{Db, StorageResult};
 use crate::server::Server;
 use crate::util;
 
@@ -46,8 +49,18 @@ pub async fn timeout_processing_loop(
 ///
 /// Called by the background loop and `debug.tick`.
 pub fn process_all_timeouts(db: &dyn Db, time: i64) -> StorageResult<()> {
+    let before = db.snap()?;
+
     // Run the three tick CTE statements (promise timeouts, task retry, task lease)
     db.process_timeouts(time)?;
+
+    let after = db.snap()?;
+    dafny_timeout_batch::validate_timeout_batch_result(
+        &before,
+        &after,
+        time,
+        db.task_retry_timeout(),
+    )?;
 
     // Process expired schedules (application-level cron computation)
     process_schedule_timeouts(db, time)?;
@@ -59,31 +72,36 @@ pub fn process_all_timeouts(db: &dyn Db, time: i64) -> StorageResult<()> {
 fn process_schedule_timeouts(db: &dyn Db, time: i64) -> StorageResult<()> {
     let expired = db.get_expired_schedules(time)?;
     for schedule in expired {
-        let mut cron_time = schedule.next_run_at;
-        let mut runs = Vec::new();
-
-        while cron_time <= time {
-            let promise_id = schedule
-                .promise_id
-                .replace("{{.id}}", &schedule.id)
-                .replace("{{.timestamp}}", &cron_time.to_string());
-
-            let timeout_at = cron_time + schedule.promise_timeout;
-
-            runs.push(ScheduleRun {
-                id: promise_id,
-                timeout_at,
-                created_at: cron_time,
-            });
-
-            let next = util::compute_next_cron(&schedule.cron, cron_time);
-            cron_time = next;
-        }
+        let planned = dafny_schedule_planner::plan_schedule_batch_with_final_next(&schedule, time)?;
+        let runs = planned.runs;
 
         if !runs.is_empty() {
+            let advance_plan = dafny_runtime_kernel::plan_schedule_advance(
+                &schedule,
+                &runs,
+                planned.final_next_run_at,
+            )?;
+            if !advance_plan.allowed {
+                return Err(crate::persistence::StorageError::Backend(format!(
+                    "Dafny schedule advance rejected runtime batch for schedule {}",
+                    schedule.id
+                )));
+            }
             metrics::SCHEDULE_PROMISES_TOTAL.inc_by(runs.len() as f64);
-            let last_run_at = runs.last().map(|r| r.created_at).unwrap();
-            db.schedule_run(&schedule.id, last_run_at, cron_time, &runs)?;
+            let updated = db
+                .schedule_run(
+                    &schedule.id,
+                    runs.last().map(|r| r.created_at).unwrap(),
+                    planned.final_next_run_at,
+                    &runs,
+                )?
+                .ok_or_else(|| {
+                    crate::persistence::StorageError::Backend(format!(
+                        "schedule {} disappeared during schedule_run",
+                        schedule.id
+                    ))
+                })?;
+            dafny_runtime_kernel::validate_schedule_advance_result(&advance_plan, &updated)?;
         }
     }
     Ok(())

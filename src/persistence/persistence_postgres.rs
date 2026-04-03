@@ -1901,12 +1901,18 @@ impl Db for PostgresDb<'_> {
             })
             .collect();
 
-        let cb_rows = rt_block_on(sqlx::query("SELECT awaiter_id, awaited_id FROM callbacks WHERE NOT ready ORDER BY awaiter_id, awaited_id").fetch_all(self.tx().as_mut()))?;
+        let cb_rows = rt_block_on(
+            sqlx::query(
+                "SELECT awaiter_id, awaited_id, ready FROM callbacks ORDER BY awaiter_id, awaited_id",
+            )
+            .fetch_all(self.tx().as_mut()),
+        )?;
         let callbacks: Vec<SnapshotCallback> = cb_rows
             .iter()
             .map(|r| SnapshotCallback {
                 awaiter: r.get("awaiter_id"),
                 awaited: r.get("awaited_id"),
+                ready: r.get("ready"),
             })
             .collect();
 
